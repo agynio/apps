@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 
 	appsv1 "github.com/agynio/apps/.gen/go/agynio/api/apps/v1"
 	authorizationv1 "github.com/agynio/apps/.gen/go/agynio/api/authorization/v1"
@@ -20,22 +21,32 @@ import (
 )
 
 const (
-	clusterObject      = "cluster:global"
-	clusterAdminAction = "admin"
-	clusterWriteAction = "writer"
-	identityMetadata   = "x-identity-id"
+	clusterObject            = "cluster:global"
+	clusterAdminAction       = "admin"
+	clusterAppWriterRelation = "writer"
+	identityMetadata         = "x-identity-id"
 )
+
+type AppStore interface {
+	CreateApp(ctx context.Context, input store.CreateAppInput) (store.App, error)
+	GetApp(ctx context.Context, id uuid.UUID) (store.App, error)
+	GetAppBySlug(ctx context.Context, slug string) (store.App, error)
+	GetAppByIdentityID(ctx context.Context, identityID uuid.UUID) (store.App, error)
+	GetAppByServiceTokenHash(ctx context.Context, tokenHash string) (store.App, error)
+	ListApps(ctx context.Context, pageSize int, pageToken string) ([]store.App, string, error)
+	DeleteApp(ctx context.Context, id uuid.UUID) error
+}
 
 type Server struct {
 	appsv1.UnimplementedAppsServiceServer
-	store                 *store.Store
-	identityClient        identityv1.IdentityServiceClient
-	authorizationClient   authorizationv1.AuthorizationServiceClient
-	zitiManagementClient  zitimanagementv1.ZitiManagementServiceClient
+	store                AppStore
+	identityClient       identityv1.IdentityServiceClient
+	authorizationClient  authorizationv1.AuthorizationServiceClient
+	zitiManagementClient zitimanagementv1.ZitiManagementServiceClient
 }
 
 func New(
-	store *store.Store,
+	store AppStore,
 	identityClient identityv1.IdentityServiceClient,
 	authorizationClient authorizationv1.AuthorizationServiceClient,
 	zitiManagementClient zitimanagementv1.ZitiManagementServiceClient,
@@ -85,11 +96,13 @@ func (s *Server) RegisterApp(ctx context.Context, req *appsv1.RegisterAppRequest
 		Slug:       slug,
 	})
 	if err != nil {
+		s.cleanupIdentity(ctx, identityID)
 		return nil, status.Errorf(codes.Internal, "create ziti identity: %v", err)
 	}
 
 	if err := s.writeAppAuthorization(ctx, identityID); err != nil {
 		s.cleanupZitiIdentity(ctx, zitiResp.GetZitiIdentityId(), zitiResp.GetZitiServiceId())
+		s.cleanupIdentity(ctx, identityID)
 		return nil, err
 	}
 
@@ -107,6 +120,7 @@ func (s *Server) RegisterApp(ctx context.Context, req *appsv1.RegisterAppRequest
 	if err != nil {
 		s.cleanupZitiIdentity(ctx, zitiResp.GetZitiIdentityId(), zitiResp.GetZitiServiceId())
 		s.cleanupAuthorization(ctx, identityID)
+		s.cleanupIdentity(ctx, identityID)
 		return nil, toStatusError(err)
 	}
 
@@ -193,10 +207,11 @@ func (s *Server) GetAppProfile(ctx context.Context, req *appsv1.GetAppProfileReq
 }
 
 func (s *Server) ValidateServiceToken(ctx context.Context, req *appsv1.ValidateServiceTokenRequest) (*appsv1.ValidateServiceTokenResponse, error) {
-	tokenHash := req.GetTokenHash()
-	if tokenHash == "" {
-		return nil, status.Error(codes.InvalidArgument, "token_hash must be provided")
+	token := req.GetTokenHash()
+	if token == "" {
+		return nil, status.Error(codes.InvalidArgument, "service_token must be provided")
 	}
+	tokenHash := hashServiceToken(token)
 	app, err := s.store.GetAppByServiceTokenHash(ctx, tokenHash)
 	if err != nil {
 		return nil, toStatusError(err)
@@ -226,7 +241,7 @@ func (s *Server) writeAppAuthorization(ctx context.Context, identityID uuid.UUID
 		Writes: []*authorizationv1.TupleKey{
 			{
 				User:     fmt.Sprintf("identity:%s", identityID.String()),
-				Relation: clusterWriteAction,
+				Relation: clusterAppWriterRelation,
 				Object:   clusterObject,
 			},
 		},
@@ -238,22 +253,36 @@ func (s *Server) writeAppAuthorization(ctx context.Context, identityID uuid.UUID
 }
 
 func (s *Server) cleanupAuthorization(ctx context.Context, identityID uuid.UUID) {
-	_, _ = s.authorizationClient.Write(ctx, &authorizationv1.WriteRequest{
+	if _, err := s.authorizationClient.Write(ctx, &authorizationv1.WriteRequest{
 		Deletes: []*authorizationv1.TupleKey{
 			{
 				User:     fmt.Sprintf("identity:%s", identityID.String()),
-				Relation: clusterWriteAction,
+				Relation: clusterAppWriterRelation,
 				Object:   clusterObject,
 			},
 		},
-	})
+	}); err != nil {
+		log.Printf("WARN: best-effort cleanup of authz tuple for identity %s failed: %v", identityID, err)
+	}
 }
 
 func (s *Server) cleanupZitiIdentity(ctx context.Context, zitiIdentityID string, zitiServiceID string) {
-	_, _ = s.zitiManagementClient.DeleteAppIdentity(ctx, &zitimanagementv1.DeleteAppIdentityRequest{
+	if _, err := s.zitiManagementClient.DeleteAppIdentity(ctx, &zitimanagementv1.DeleteAppIdentityRequest{
 		ZitiIdentityId: zitiIdentityID,
 		ZitiServiceId:  zitiServiceID,
+	}); err != nil {
+		log.Printf("WARN: best-effort cleanup of ziti identity %s failed: %v", zitiIdentityID, err)
+	}
+}
+
+func (s *Server) cleanupIdentity(ctx context.Context, identityID uuid.UUID) {
+	_, err := s.identityClient.RegisterIdentity(ctx, &identityv1.RegisterIdentityRequest{
+		IdentityId:   identityID.String(),
+		IdentityType: identityv1.IdentityType_IDENTITY_TYPE_UNSPECIFIED,
 	})
+	if err != nil {
+		log.Printf("WARN: best-effort cleanup of identity %s failed: %v", identityID, err)
+	}
 }
 
 func identityFromMetadata(ctx context.Context) (uuid.UUID, error) {
@@ -282,8 +311,12 @@ func newServiceToken() (string, string, error) {
 		return "", "", err
 	}
 	token := hex.EncodeToString(buffer)
+	return token, hashServiceToken(token), nil
+}
+
+func hashServiceToken(token string) string {
 	hash := sha256.Sum256([]byte(token))
-	return token, hex.EncodeToString(hash[:]), nil
+	return hex.EncodeToString(hash[:])
 }
 
 func parseUUID(value string) (uuid.UUID, error) {

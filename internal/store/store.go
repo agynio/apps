@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -169,28 +168,25 @@ func (s *Store) ListApps(ctx context.Context, pageSize int, pageToken string) ([
 	limit := normalizePageSize(pageSize)
 
 	var (
-		clauses []string
-		args    []any
+		rows pgx.Rows
+		err  error
 	)
 	if pageToken != "" {
 		afterID, err := decodePageToken(pageToken)
 		if err != nil {
 			return nil, "", InvalidPageToken(err)
 		}
-		clauses = append(clauses, fmt.Sprintf("id > $%d", len(args)+1))
-		args = append(args, afterID)
+		rows, err = s.pool.Query(ctx,
+			fmt.Sprintf("SELECT %s FROM apps WHERE id > $1 ORDER BY id ASC LIMIT $2", appColumns),
+			afterID,
+			limit+1,
+		)
+	} else {
+		rows, err = s.pool.Query(ctx,
+			fmt.Sprintf("SELECT %s FROM apps ORDER BY id ASC LIMIT $1", appColumns),
+			limit+1,
+		)
 	}
-
-	query := strings.Builder{}
-	query.WriteString(fmt.Sprintf("SELECT %s FROM apps", appColumns))
-	if len(clauses) > 0 {
-		query.WriteString(" WHERE ")
-		query.WriteString(strings.Join(clauses, " AND "))
-	}
-	query.WriteString(fmt.Sprintf(" ORDER BY id ASC LIMIT $%d", len(args)+1))
-	args = append(args, limit+1)
-
-	rows, err := s.pool.Query(ctx, query.String(), args...)
 	if err != nil {
 		return nil, "", err
 	}

@@ -53,19 +53,19 @@ func run() error {
 		return fmt.Errorf("apply migrations: %w", err)
 	}
 
-	identityConn, err := grpc.DialContext(ctx, cfg.IdentityGRPCTarget, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+	identityConn, err := grpc.NewClient(cfg.IdentityGRPCTarget, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return fmt.Errorf("connect to identity: %w", err)
 	}
 	defer identityConn.Close()
 
-	authConn, err := grpc.DialContext(ctx, cfg.AuthorizationGRPCTarget, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+	authConn, err := grpc.NewClient(cfg.AuthorizationGRPCTarget, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return fmt.Errorf("connect to authorization: %w", err)
 	}
 	defer authConn.Close()
 
-	zitiConn, err := grpc.DialContext(ctx, cfg.ZitiManagementGRPCTarget, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+	zitiConn, err := grpc.NewClient(cfg.ZitiManagementGRPCTarget, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return fmt.Errorf("connect to ziti management: %w", err)
 	}
