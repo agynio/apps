@@ -1,0 +1,21 @@
+# TODO: Switch to github.com/agynio/api Go bindings once published.
+version: v2
+
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/agynio/apps/.gen/go
+
+plugins:
+  - remote: buf.build/protocolbuffers/go
+    out: .gen/go
+    opt:
+      - paths=source_relative
+    include_imports: true
+  - remote: buf.build/grpc/go
+    out: .gen/go
+    opt:
+      - paths=source_relative
+      - require_unimplemented_servers=false
+    include_imports: true
