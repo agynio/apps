@@ -269,11 +269,8 @@ func TestRegisterAppRollbackOnZitiError(t *testing.T) {
 	if status.Code(err) != codes.Internal {
 		t.Fatalf("expected internal error, got %v", status.Code(err))
 	}
-	if len(identityClient.registerRequests) != 2 {
-		t.Fatalf("expected identity cleanup after ziti failure")
-	}
-	if identityClient.registerRequests[1].IdentityType != identityv1.IdentityType_IDENTITY_TYPE_UNSPECIFIED {
-		t.Fatalf("expected identity cleanup to use unspecified type")
+	if len(identityClient.registerRequests) != 1 {
+		t.Fatalf("expected identity registration before ziti failure")
 	}
 	if len(authorizationClient.writeRequests) != 0 {
 		t.Fatalf("did not expect authz write")
@@ -301,8 +298,8 @@ func TestRegisterAppRollbackOnAuthzWriteError(t *testing.T) {
 	if len(zitiClient.deleteRequests) != 1 {
 		t.Fatalf("expected ziti cleanup")
 	}
-	if len(identityClient.registerRequests) != 2 {
-		t.Fatalf("expected identity cleanup after authz failure")
+	if len(identityClient.registerRequests) != 1 {
+		t.Fatalf("expected identity registration before authz failure")
 	}
 	if len(store.createInputs) != 0 {
 		t.Fatalf("did not expect store create")
@@ -333,8 +330,8 @@ func TestRegisterAppRollbackOnStoreError(t *testing.T) {
 	if len(authorizationClient.writeRequests[1].Deletes) != 1 {
 		t.Fatalf("expected authz delete in cleanup")
 	}
-	if len(identityClient.registerRequests) != 2 {
-		t.Fatalf("expected identity cleanup")
+	if len(identityClient.registerRequests) != 1 {
+		t.Fatalf("expected identity registration before store failure")
 	}
 }
 

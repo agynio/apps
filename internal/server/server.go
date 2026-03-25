@@ -96,13 +96,15 @@ func (s *Server) RegisterApp(ctx context.Context, req *appsv1.RegisterAppRequest
 		Slug:       slug,
 	})
 	if err != nil {
-		s.cleanupIdentity(ctx, identityID)
+		// TODO: clean up orphaned identity once Identity service supports deletion.
+		log.Printf("WARN: orphaned identity %s after ziti failure", identityID)
 		return nil, status.Errorf(codes.Internal, "create ziti identity: %v", err)
 	}
 
 	if err := s.writeAppAuthorization(ctx, identityID); err != nil {
 		s.cleanupZitiIdentity(ctx, zitiResp.GetZitiIdentityId(), zitiResp.GetZitiServiceId())
-		s.cleanupIdentity(ctx, identityID)
+		// TODO: clean up orphaned identity once Identity service supports deletion.
+		log.Printf("WARN: orphaned identity %s after authorization failure", identityID)
 		return nil, err
 	}
 
@@ -120,7 +122,8 @@ func (s *Server) RegisterApp(ctx context.Context, req *appsv1.RegisterAppRequest
 	if err != nil {
 		s.cleanupZitiIdentity(ctx, zitiResp.GetZitiIdentityId(), zitiResp.GetZitiServiceId())
 		s.cleanupAuthorization(ctx, identityID)
-		s.cleanupIdentity(ctx, identityID)
+		// TODO: clean up orphaned identity once Identity service supports deletion.
+		log.Printf("WARN: orphaned identity %s after store failure", identityID)
 		return nil, toStatusError(err)
 	}
 
@@ -207,6 +210,8 @@ func (s *Server) GetAppProfile(ctx context.Context, req *appsv1.GetAppProfileReq
 }
 
 func (s *Server) ValidateServiceToken(ctx context.Context, req *appsv1.ValidateServiceTokenRequest) (*appsv1.ValidateServiceTokenResponse, error) {
+	// NOTE: ValidateServiceTokenRequest.token_hash currently carries the raw service token.
+	// The server hashes it until the proto field is renamed.
 	token := req.GetTokenHash()
 	if token == "" {
 		return nil, status.Error(codes.InvalidArgument, "service_token must be provided")
@@ -272,16 +277,6 @@ func (s *Server) cleanupZitiIdentity(ctx context.Context, zitiIdentityID string,
 		ZitiServiceId:  zitiServiceID,
 	}); err != nil {
 		log.Printf("WARN: best-effort cleanup of ziti identity %s failed: %v", zitiIdentityID, err)
-	}
-}
-
-func (s *Server) cleanupIdentity(ctx context.Context, identityID uuid.UUID) {
-	_, err := s.identityClient.RegisterIdentity(ctx, &identityv1.RegisterIdentityRequest{
-		IdentityId:   identityID.String(),
-		IdentityType: identityv1.IdentityType_IDENTITY_TYPE_UNSPECIFIED,
-	})
-	if err != nil {
-		log.Printf("WARN: best-effort cleanup of identity %s failed: %v", identityID, err)
 	}
 }
 
