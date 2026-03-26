@@ -35,6 +35,7 @@ type AppStore interface {
 	GetAppByServiceTokenHash(ctx context.Context, tokenHash string) (store.App, error)
 	ListApps(ctx context.Context, pageSize int, pageToken string) ([]store.App, string, error)
 	DeleteApp(ctx context.Context, id uuid.UUID) error
+	UpdateAppZitiIdentity(ctx context.Context, id uuid.UUID, zitiIdentityID string, zitiServiceID string) error
 }
 
 type Server struct {
@@ -91,18 +92,7 @@ func (s *Server) RegisterApp(ctx context.Context, req *appsv1.RegisterAppRequest
 		return nil, status.Errorf(codes.Internal, "register identity: %v", err)
 	}
 
-	zitiResp, err := s.zitiManagementClient.CreateAppIdentity(ctx, &zitimanagementv1.CreateAppIdentityRequest{
-		IdentityId: identityID.String(),
-		Slug:       slug,
-	})
-	if err != nil {
-		// TODO: clean up orphaned identity once Identity service supports deletion.
-		log.Printf("WARN: orphaned identity %s after ziti failure", identityID)
-		return nil, status.Errorf(codes.Internal, "create ziti identity: %v", err)
-	}
-
 	if err := s.writeAppAuthorization(ctx, identityID); err != nil {
-		s.cleanupZitiIdentity(ctx, zitiResp.GetZitiIdentityId(), zitiResp.GetZitiServiceId())
 		// TODO: clean up orphaned identity once Identity service supports deletion.
 		log.Printf("WARN: orphaned identity %s after authorization failure", identityID)
 		return nil, err
@@ -116,11 +106,10 @@ func (s *Server) RegisterApp(ctx context.Context, req *appsv1.RegisterAppRequest
 		Icon:             req.GetIcon(),
 		IdentityID:       identityID,
 		ServiceTokenHash: tokenHash,
-		ZitiIdentityID:   zitiResp.GetZitiIdentityId(),
-		ZitiServiceID:    zitiResp.GetZitiServiceId(),
+		ZitiIdentityID:   "",
+		ZitiServiceID:    "",
 	})
 	if err != nil {
-		s.cleanupZitiIdentity(ctx, zitiResp.GetZitiIdentityId(), zitiResp.GetZitiServiceId())
 		s.cleanupAuthorization(ctx, identityID)
 		// TODO: clean up orphaned identity once Identity service supports deletion.
 		log.Printf("WARN: orphaned identity %s after store failure", identityID)
@@ -188,7 +177,9 @@ func (s *Server) DeleteApp(ctx context.Context, req *appsv1.DeleteAppRequest) (*
 		return nil, toStatusError(err)
 	}
 
-	s.cleanupZitiIdentity(ctx, app.ZitiIdentityID, app.ZitiServiceID)
+	if app.ZitiIdentityID != "" {
+		s.cleanupZitiIdentity(ctx, app.ZitiIdentityID, app.ZitiServiceID)
+	}
 	s.cleanupAuthorization(ctx, app.IdentityID)
 
 	if err := s.store.DeleteApp(ctx, id); err != nil {
@@ -222,6 +213,40 @@ func (s *Server) ValidateServiceToken(ctx context.Context, req *appsv1.ValidateS
 		return nil, toStatusError(err)
 	}
 	return &appsv1.ValidateServiceTokenResponse{App: toProtoApp(app)}, nil
+}
+
+func (s *Server) EnrollApp(ctx context.Context, req *appsv1.EnrollAppRequest) (*appsv1.EnrollAppResponse, error) {
+	token := req.GetServiceToken()
+	if token == "" {
+		return nil, status.Error(codes.InvalidArgument, "service_token must be provided")
+	}
+	tokenHash := hashServiceToken(token)
+	app, err := s.store.GetAppByServiceTokenHash(ctx, tokenHash)
+	if err != nil {
+		return nil, toStatusError(err)
+	}
+
+	if app.ZitiIdentityID != "" {
+		s.cleanupZitiIdentity(ctx, app.ZitiIdentityID, app.ZitiServiceID)
+	}
+
+	zitiResp, err := s.zitiManagementClient.CreateAppIdentity(ctx, &zitimanagementv1.CreateAppIdentityRequest{
+		IdentityId: app.IdentityID.String(),
+		Slug:       app.Slug,
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "create ziti identity: %v", err)
+	}
+
+	if err := s.store.UpdateAppZitiIdentity(ctx, app.Meta.ID, zitiResp.GetZitiIdentityId(), zitiResp.GetZitiServiceId()); err != nil {
+		s.cleanupZitiIdentity(ctx, zitiResp.GetZitiIdentityId(), zitiResp.GetZitiServiceId())
+		return nil, status.Errorf(codes.Internal, "update ziti identity: %v", err)
+	}
+
+	return &appsv1.EnrollAppResponse{
+		IdentityJson: zitiResp.GetIdentityJson(),
+		IdentityId:   app.IdentityID.String(),
+	}, nil
 }
 
 func (s *Server) requireClusterAdmin(ctx context.Context, identityID uuid.UUID) error {

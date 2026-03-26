@@ -231,6 +231,19 @@ func (s *Store) DeleteApp(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
+func (s *Store) UpdateAppZitiIdentity(ctx context.Context, id uuid.UUID, zitiIdentityID string, zitiServiceID string) error {
+	result, err := s.pool.Exec(ctx,
+		`UPDATE apps SET ziti_identity_id = $1, ziti_service_id = $2, updated_at = NOW() WHERE id = $3`,
+		zitiIdentityID, zitiServiceID, id)
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() == 0 {
+		return NotFound("app")
+	}
+	return nil
+}
+
 func normalizePageSize(size int) int {
 	if size <= 0 {
 		return defaultListPageSize
