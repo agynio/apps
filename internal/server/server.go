@@ -177,7 +177,9 @@ func (s *Server) DeleteApp(ctx context.Context, req *appsv1.DeleteAppRequest) (*
 		return nil, toStatusError(err)
 	}
 
-	s.cleanupZitiIdentity(ctx, app.ZitiIdentityID, app.ZitiServiceID)
+	if app.ZitiIdentityID != "" {
+		s.cleanupZitiIdentity(ctx, app.ZitiIdentityID, app.ZitiServiceID)
+	}
 	s.cleanupAuthorization(ctx, app.IdentityID)
 
 	if err := s.store.DeleteApp(ctx, id); err != nil {
