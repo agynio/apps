@@ -26,9 +26,17 @@ type fakeStore struct {
 	getByServiceTokenFn    func(ctx context.Context, tokenHash string) (storepkg.App, error)
 	listFn                 func(ctx context.Context, pageSize int, pageToken string) ([]storepkg.App, string, error)
 	deleteFn               func(ctx context.Context, id uuid.UUID) error
+	updateZitiIdentityFn   func(ctx context.Context, id uuid.UUID, zitiIdentityID string, zitiServiceID string) error
 	createInputs           []storepkg.CreateAppInput
 	getCalls               []uuid.UUID
 	getByServiceTokenCalls []string
+	updateZitiCalls        []updateZitiCall
+}
+
+type updateZitiCall struct {
+	id             uuid.UUID
+	zitiIdentityID string
+	zitiServiceID  string
 }
 
 func (f *fakeStore) CreateApp(ctx context.Context, input storepkg.CreateAppInput) (storepkg.App, error) {
@@ -81,6 +89,18 @@ func (f *fakeStore) DeleteApp(ctx context.Context, id uuid.UUID) error {
 		return f.deleteFn(ctx, id)
 	}
 	return errors.New("delete app not implemented")
+}
+
+func (f *fakeStore) UpdateAppZitiIdentity(ctx context.Context, id uuid.UUID, zitiIdentityID string, zitiServiceID string) error {
+	f.updateZitiCalls = append(f.updateZitiCalls, updateZitiCall{
+		id:             id,
+		zitiIdentityID: zitiIdentityID,
+		zitiServiceID:  zitiServiceID,
+	})
+	if f.updateZitiIdentityFn != nil {
+		return f.updateZitiIdentityFn(ctx, id, zitiIdentityID, zitiServiceID)
+	}
+	return errors.New("update ziti identity not implemented")
 }
 
 type fakeIdentityClient struct {
@@ -240,6 +260,9 @@ func TestRegisterAppSuccess(t *testing.T) {
 	if store.createInputs[0].ServiceTokenHash != hashServiceToken(resp.GetServiceToken()) {
 		t.Fatalf("service token hash did not match")
 	}
+	if store.createInputs[0].ZitiIdentityID != "" || store.createInputs[0].ZitiServiceID != "" {
+		t.Fatalf("expected empty ziti enrollment fields")
+	}
 	if len(identityClient.registerRequests) != 1 {
 		t.Fatalf("expected one identity registration call")
 	}
@@ -249,34 +272,11 @@ func TestRegisterAppSuccess(t *testing.T) {
 	if len(authorizationClient.writeRequests) != 1 || len(authorizationClient.writeRequests[0].Writes) != 1 {
 		t.Fatalf("expected authorization write")
 	}
+	if len(zitiClient.createRequests) != 0 {
+		t.Fatalf("did not expect ziti create")
+	}
 	if len(zitiClient.deleteRequests) != 0 {
 		t.Fatalf("did not expect ziti delete")
-	}
-}
-
-func TestRegisterAppRollbackOnZitiError(t *testing.T) {
-	ctx, _ := newAdminContext()
-	identityClient := &fakeIdentityClient{}
-	authorizationClient := &fakeAuthorizationClient{}
-	zitiClient := &fakeZitiManagementClient{}
-	zitiClient.createFn = func(_ context.Context, _ *zitimanagementv1.CreateAppIdentityRequest) (*zitimanagementv1.CreateAppIdentityResponse, error) {
-		return nil, errors.New("ziti down")
-	}
-	store := &fakeStore{}
-
-	srv := New(store, identityClient, authorizationClient, zitiClient)
-	_, err := srv.RegisterApp(ctx, &appsv1.RegisterAppRequest{Slug: "demo", Name: "Demo"})
-	if status.Code(err) != codes.Internal {
-		t.Fatalf("expected internal error, got %v", status.Code(err))
-	}
-	if len(identityClient.registerRequests) != 1 {
-		t.Fatalf("expected identity registration before ziti failure")
-	}
-	if len(authorizationClient.writeRequests) != 0 {
-		t.Fatalf("did not expect authz write")
-	}
-	if len(store.createInputs) != 0 {
-		t.Fatalf("did not expect store create")
 	}
 }
 
@@ -295,11 +295,14 @@ func TestRegisterAppRollbackOnAuthzWriteError(t *testing.T) {
 	if status.Code(err) != codes.Internal {
 		t.Fatalf("expected internal error, got %v", status.Code(err))
 	}
-	if len(zitiClient.deleteRequests) != 1 {
-		t.Fatalf("expected ziti cleanup")
-	}
 	if len(identityClient.registerRequests) != 1 {
 		t.Fatalf("expected identity registration before authz failure")
+	}
+	if len(zitiClient.createRequests) != 0 {
+		t.Fatalf("did not expect ziti create")
+	}
+	if len(zitiClient.deleteRequests) != 0 {
+		t.Fatalf("did not expect ziti cleanup")
 	}
 	if len(store.createInputs) != 0 {
 		t.Fatalf("did not expect store create")
@@ -321,9 +324,6 @@ func TestRegisterAppRollbackOnStoreError(t *testing.T) {
 	if status.Code(err) != codes.AlreadyExists {
 		t.Fatalf("expected already exists, got %v", status.Code(err))
 	}
-	if len(zitiClient.deleteRequests) != 1 {
-		t.Fatalf("expected ziti cleanup")
-	}
 	if len(authorizationClient.writeRequests) != 2 {
 		t.Fatalf("expected authz cleanup")
 	}
@@ -332,6 +332,12 @@ func TestRegisterAppRollbackOnStoreError(t *testing.T) {
 	}
 	if len(identityClient.registerRequests) != 1 {
 		t.Fatalf("expected identity registration before store failure")
+	}
+	if len(zitiClient.createRequests) != 0 {
+		t.Fatalf("did not expect ziti create")
+	}
+	if len(zitiClient.deleteRequests) != 0 {
+		t.Fatalf("did not expect ziti cleanup")
 	}
 }
 
@@ -388,5 +394,175 @@ func TestValidateServiceTokenHashesServerSide(t *testing.T) {
 	}
 	if resp.GetApp().GetMeta().GetId() != appID.String() {
 		t.Fatalf("expected app id %s, got %s", appID.String(), resp.GetApp().GetMeta().GetId())
+	}
+}
+
+func TestEnrollAppSuccess(t *testing.T) {
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	appID := uuid.New()
+	identityID := uuid.New()
+	store.getByServiceTokenFn = func(_ context.Context, tokenHash string) (storepkg.App, error) {
+		if tokenHash != hashServiceToken("raw-token") {
+			return storepkg.App{}, errors.New("unexpected token hash")
+		}
+		return storepkg.App{
+			Meta:       storepkg.EntityMeta{ID: appID},
+			Slug:       "demo",
+			IdentityID: identityID,
+		}, nil
+	}
+	zitiClient.createFn = func(_ context.Context, _ *zitimanagementv1.CreateAppIdentityRequest) (*zitimanagementv1.CreateAppIdentityResponse, error) {
+		return &zitimanagementv1.CreateAppIdentityResponse{
+			ZitiIdentityId: "ziti-id",
+			ZitiServiceId:  "ziti-service",
+			IdentityJson:   []byte("identity-json"),
+		}, nil
+	}
+	store.updateZitiIdentityFn = func(_ context.Context, _ uuid.UUID, _ string, _ string) error { return nil }
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	resp, err := srv.EnrollApp(context.Background(), &appsv1.EnrollAppRequest{ServiceToken: "raw-token"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(resp.GetIdentityJson()) != "identity-json" {
+		t.Fatalf("expected identity json payload")
+	}
+	if resp.GetIdentityId() != identityID.String() {
+		t.Fatalf("expected identity id %s, got %s", identityID.String(), resp.GetIdentityId())
+	}
+	if len(zitiClient.createRequests) != 1 {
+		t.Fatalf("expected ziti create")
+	}
+	if zitiClient.createRequests[0].GetIdentityId() != identityID.String() {
+		t.Fatalf("expected identity id in ziti create request")
+	}
+	if zitiClient.createRequests[0].GetSlug() != "demo" {
+		t.Fatalf("expected slug in ziti create request")
+	}
+	if len(store.updateZitiCalls) != 1 {
+		t.Fatalf("expected ziti update call")
+	}
+	if store.updateZitiCalls[0].id != appID {
+		t.Fatalf("expected update for app %s", appID)
+	}
+	if store.updateZitiCalls[0].zitiIdentityID != "ziti-id" || store.updateZitiCalls[0].zitiServiceID != "ziti-service" {
+		t.Fatalf("unexpected ziti update values")
+	}
+	if len(zitiClient.deleteRequests) != 0 {
+		t.Fatalf("did not expect ziti cleanup")
+	}
+}
+
+func TestEnrollAppReenrollCleansUpExisting(t *testing.T) {
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	appID := uuid.New()
+	identityID := uuid.New()
+	store.getByServiceTokenFn = func(_ context.Context, _ string) (storepkg.App, error) {
+		return storepkg.App{
+			Meta:           storepkg.EntityMeta{ID: appID},
+			Slug:           "demo",
+			IdentityID:     identityID,
+			ZitiIdentityID: "old-ziti",
+			ZitiServiceID:  "old-service",
+		}, nil
+	}
+	zitiClient.createFn = func(_ context.Context, _ *zitimanagementv1.CreateAppIdentityRequest) (*zitimanagementv1.CreateAppIdentityResponse, error) {
+		return &zitimanagementv1.CreateAppIdentityResponse{ZitiIdentityId: "new-ziti", ZitiServiceId: "new-service"}, nil
+	}
+	store.updateZitiIdentityFn = func(_ context.Context, _ uuid.UUID, _ string, _ string) error { return nil }
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	_, err := srv.EnrollApp(context.Background(), &appsv1.EnrollAppRequest{ServiceToken: "raw-token"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(zitiClient.deleteRequests) != 1 {
+		t.Fatalf("expected ziti cleanup for existing identity")
+	}
+	if zitiClient.deleteRequests[0].GetZitiIdentityId() != "old-ziti" {
+		t.Fatalf("expected cleanup for old ziti identity")
+	}
+	if zitiClient.deleteRequests[0].GetZitiServiceId() != "old-service" {
+		t.Fatalf("expected cleanup for old ziti service")
+	}
+}
+
+func TestEnrollAppMissingToken(t *testing.T) {
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	_, err := srv.EnrollApp(context.Background(), &appsv1.EnrollAppRequest{})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected invalid argument, got %v", status.Code(err))
+	}
+}
+
+func TestEnrollAppNotFound(t *testing.T) {
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	store.getByServiceTokenFn = func(_ context.Context, _ string) (storepkg.App, error) {
+		return storepkg.App{}, storepkg.NotFound("app")
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	_, err := srv.EnrollApp(context.Background(), &appsv1.EnrollAppRequest{ServiceToken: "raw-token"})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("expected not found, got %v", status.Code(err))
+	}
+	if len(zitiClient.createRequests) != 0 {
+		t.Fatalf("did not expect ziti create")
+	}
+	if len(store.updateZitiCalls) != 0 {
+		t.Fatalf("did not expect update call")
+	}
+}
+
+func TestEnrollAppUpdateFailureCleansUpZiti(t *testing.T) {
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	appID := uuid.New()
+	identityID := uuid.New()
+	store.getByServiceTokenFn = func(_ context.Context, _ string) (storepkg.App, error) {
+		return storepkg.App{
+			Meta:       storepkg.EntityMeta{ID: appID},
+			Slug:       "demo",
+			IdentityID: identityID,
+		}, nil
+	}
+	zitiClient.createFn = func(_ context.Context, _ *zitimanagementv1.CreateAppIdentityRequest) (*zitimanagementv1.CreateAppIdentityResponse, error) {
+		return &zitimanagementv1.CreateAppIdentityResponse{ZitiIdentityId: "ziti-id", ZitiServiceId: "ziti-service"}, nil
+	}
+	store.updateZitiIdentityFn = func(_ context.Context, _ uuid.UUID, _ string, _ string) error {
+		return errors.New("db down")
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	_, err := srv.EnrollApp(context.Background(), &appsv1.EnrollAppRequest{ServiceToken: "raw-token"})
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("expected internal error, got %v", status.Code(err))
+	}
+	if len(zitiClient.deleteRequests) != 1 {
+		t.Fatalf("expected ziti cleanup after update failure")
+	}
+	if zitiClient.deleteRequests[0].GetZitiIdentityId() != "ziti-id" {
+		t.Fatalf("expected cleanup for new ziti identity")
 	}
 }
