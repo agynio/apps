@@ -402,7 +402,11 @@ func (s *Server) InstallApp(ctx context.Context, req *appsv1.InstallAppRequest) 
 		return nil, err
 	}
 
-	return &appsv1.InstallAppResponse{Installation: toProtoInstallation(installation)}, nil
+	protoInstallation, err := toProtoInstallation(installation)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "convert installation: %v", err)
+	}
+	return &appsv1.InstallAppResponse{Installation: protoInstallation}, nil
 }
 
 func (s *Server) GetInstallation(ctx context.Context, req *appsv1.GetInstallationRequest) (*appsv1.GetInstallationResponse, error) {
@@ -414,7 +418,11 @@ func (s *Server) GetInstallation(ctx context.Context, req *appsv1.GetInstallatio
 	if err != nil {
 		return nil, toStatusError(err)
 	}
-	return &appsv1.GetInstallationResponse{Installation: toProtoInstallation(installation)}, nil
+	protoInstallation, err := toProtoInstallation(installation)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "convert installation: %v", err)
+	}
+	return &appsv1.GetInstallationResponse{Installation: protoInstallation}, nil
 }
 
 func (s *Server) GetInstallationBySlug(ctx context.Context, req *appsv1.GetInstallationBySlugRequest) (*appsv1.GetInstallationBySlugResponse, error) {
@@ -430,7 +438,11 @@ func (s *Server) GetInstallationBySlug(ctx context.Context, req *appsv1.GetInsta
 	if err != nil {
 		return nil, toStatusError(err)
 	}
-	return &appsv1.GetInstallationBySlugResponse{Installation: toProtoInstallation(installation)}, nil
+	protoInstallation, err := toProtoInstallation(installation)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "convert installation: %v", err)
+	}
+	return &appsv1.GetInstallationBySlugResponse{Installation: protoInstallation}, nil
 }
 
 func (s *Server) ListInstallations(ctx context.Context, req *appsv1.ListInstallationsRequest) (*appsv1.ListInstallationsResponse, error) {
@@ -460,7 +472,11 @@ func (s *Server) ListInstallations(ctx context.Context, req *appsv1.ListInstalla
 	}
 	protoInstallations := make([]*appsv1.Installation, 0, len(installations))
 	for _, installation := range installations {
-		protoInstallations = append(protoInstallations, toProtoInstallation(installation))
+		protoInstallation, err := toProtoInstallation(installation)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "convert installation: %v", err)
+		}
+		protoInstallations = append(protoInstallations, protoInstallation)
 	}
 	return &appsv1.ListInstallationsResponse{Installations: protoInstallations, NextPageToken: nextToken}, nil
 }
@@ -499,7 +515,11 @@ func (s *Server) UpdateInstallation(ctx context.Context, req *appsv1.UpdateInsta
 	if err != nil {
 		return nil, toStatusError(err)
 	}
-	return &appsv1.UpdateInstallationResponse{Installation: toProtoInstallation(installation)}, nil
+	protoInstallation, err := toProtoInstallation(installation)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "convert installation: %v", err)
+	}
+	return &appsv1.UpdateInstallationResponse{Installation: protoInstallation}, nil
 }
 
 func (s *Server) UninstallApp(ctx context.Context, req *appsv1.UninstallAppRequest) (*appsv1.UninstallAppResponse, error) {
@@ -549,7 +569,11 @@ func (s *Server) GetInstallationConfiguration(ctx context.Context, req *appsv1.G
 	if app.IdentityID != callerID {
 		return nil, status.Error(codes.PermissionDenied, "permission denied")
 	}
-	return &appsv1.GetInstallationConfigurationResponse{Configuration: mapToProtoStruct(installation.Configuration)}, nil
+	configuration, err := mapToProtoStruct(installation.Configuration)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "convert configuration: %v", err)
+	}
+	return &appsv1.GetInstallationConfigurationResponse{Configuration: configuration}, nil
 }
 
 func (s *Server) requireOrgOwner(ctx context.Context, identityID uuid.UUID, organizationID uuid.UUID) error {
@@ -615,7 +639,7 @@ func (s *Server) deleteInstallationTuples(ctx context.Context, app store.App, or
 	for _, permission := range app.Permissions {
 		relation, ok := permissionToRelation[permission]
 		if !ok {
-			log.Printf("WARN: unknown permission %q for installation cleanup", permission)
+			log.Printf("ERROR: unknown permission %q for installation cleanup", permission)
 			continue
 		}
 		tuples = append(tuples, &authorizationv1.TupleKey{

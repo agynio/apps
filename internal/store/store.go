@@ -242,37 +242,65 @@ func (s *Store) GetAppByServiceTokenHash(ctx context.Context, tokenHash string) 
 	return app, nil
 }
 
+type listQueryBuilder struct {
+	conditions []string
+	args       []any
+	argID      int
+}
+
+func newListQueryBuilder(pageToken string) (*listQueryBuilder, error) {
+	builder := &listQueryBuilder{
+		conditions: make([]string, 0, 3),
+		args:       make([]any, 0, 4),
+		argID:      1,
+	}
+	if pageToken == "" {
+		return builder, nil
+	}
+	afterID, err := decodePageToken(pageToken)
+	if err != nil {
+		return nil, err
+	}
+	builder.addRawCondition("id > $%d", afterID)
+	return builder, nil
+}
+
+func (b *listQueryBuilder) addCondition(column string, value any) {
+	b.conditions = append(b.conditions, fmt.Sprintf("%s = $%d", column, b.argID))
+	b.args = append(b.args, value)
+	b.argID++
+}
+
+func (b *listQueryBuilder) addRawCondition(format string, value any) {
+	b.conditions = append(b.conditions, fmt.Sprintf(format, b.argID))
+	b.args = append(b.args, value)
+	b.argID++
+}
+
+func (b *listQueryBuilder) build(baseQuery string, limit int) (string, []any) {
+	query := baseQuery
+	if len(b.conditions) > 0 {
+		query = fmt.Sprintf("%s WHERE %s", query, strings.Join(b.conditions, " AND "))
+	}
+	query = fmt.Sprintf("%s ORDER BY id ASC LIMIT $%d", query, b.argID)
+	args := append(b.args, limit+1)
+	return query, args
+}
+
 func (s *Store) ListApps(ctx context.Context, pageSize int, pageToken string, filter ListAppsFilter) ([]App, string, error) {
 	limit := normalizePageSize(pageSize)
 
-	conditions := make([]string, 0, 3)
-	args := make([]any, 0, 4)
-	argID := 1
-	if pageToken != "" {
-		afterID, err := decodePageToken(pageToken)
-		if err != nil {
-			return nil, "", InvalidPageToken(err)
-		}
-		conditions = append(conditions, fmt.Sprintf("id > $%d", argID))
-		args = append(args, afterID)
-		argID++
+	builder, err := newListQueryBuilder(pageToken)
+	if err != nil {
+		return nil, "", InvalidPageToken(err)
 	}
 	if filter.OrganizationID != nil {
-		conditions = append(conditions, fmt.Sprintf("organization_id = $%d", argID))
-		args = append(args, *filter.OrganizationID)
-		argID++
+		builder.addCondition("organization_id", *filter.OrganizationID)
 	}
 	if filter.Visibility != nil {
-		conditions = append(conditions, fmt.Sprintf("visibility = $%d", argID))
-		args = append(args, *filter.Visibility)
-		argID++
+		builder.addCondition("visibility", *filter.Visibility)
 	}
-	query := fmt.Sprintf("SELECT %s FROM apps", appColumns)
-	if len(conditions) > 0 {
-		query = fmt.Sprintf("%s WHERE %s", query, strings.Join(conditions, " AND "))
-	}
-	query = fmt.Sprintf("%s ORDER BY id ASC LIMIT $%d", query, argID)
-	args = append(args, limit+1)
+	query, args := builder.build(fmt.Sprintf("SELECT %s FROM apps", appColumns), limit)
 	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, "", err
@@ -436,34 +464,17 @@ func (s *Store) GetInstallationBySlug(ctx context.Context, organizationID uuid.U
 func (s *Store) ListInstallations(ctx context.Context, pageSize int, pageToken string, filter ListInstallationsFilter) ([]Installation, string, error) {
 	limit := normalizePageSize(pageSize)
 
-	conditions := make([]string, 0, 3)
-	args := make([]any, 0, 4)
-	argID := 1
-	if pageToken != "" {
-		afterID, err := decodePageToken(pageToken)
-		if err != nil {
-			return nil, "", InvalidPageToken(err)
-		}
-		conditions = append(conditions, fmt.Sprintf("id > $%d", argID))
-		args = append(args, afterID)
-		argID++
+	builder, err := newListQueryBuilder(pageToken)
+	if err != nil {
+		return nil, "", InvalidPageToken(err)
 	}
 	if filter.OrganizationID != nil {
-		conditions = append(conditions, fmt.Sprintf("organization_id = $%d", argID))
-		args = append(args, *filter.OrganizationID)
-		argID++
+		builder.addCondition("organization_id", *filter.OrganizationID)
 	}
 	if filter.AppID != nil {
-		conditions = append(conditions, fmt.Sprintf("app_id = $%d", argID))
-		args = append(args, *filter.AppID)
-		argID++
+		builder.addCondition("app_id", *filter.AppID)
 	}
-	query := fmt.Sprintf("SELECT %s FROM app_installations", installationColumns)
-	if len(conditions) > 0 {
-		query = fmt.Sprintf("%s WHERE %s", query, strings.Join(conditions, " AND "))
-	}
-	query = fmt.Sprintf("%s ORDER BY id ASC LIMIT $%d", query, argID)
-	args = append(args, limit+1)
+	query, args := builder.build(fmt.Sprintf("SELECT %s FROM app_installations", installationColumns), limit)
 	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, "", err

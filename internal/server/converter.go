@@ -33,14 +33,18 @@ func toProtoApp(app store.App) *appsv1.App {
 	}
 }
 
-func toProtoInstallation(installation store.Installation) *appsv1.Installation {
+func toProtoInstallation(installation store.Installation) (*appsv1.Installation, error) {
+	configuration, err := mapToProtoStruct(installation.Configuration)
+	if err != nil {
+		return nil, err
+	}
 	return &appsv1.Installation{
 		Meta:           toProtoEntityMeta(installation.Meta),
 		AppId:          installation.AppID.String(),
 		OrganizationId: installation.OrganizationID.String(),
 		Slug:           installation.Slug,
-		Configuration:  mapToProtoStruct(installation.Configuration),
-	}
+		Configuration:  configuration,
+	}, nil
 }
 
 func toProtoVisibility(visibility store.AppVisibility) appsv1.AppVisibility {
@@ -72,15 +76,15 @@ func protoStructToMap(value *structpb.Struct) map[string]any {
 	return value.AsMap()
 }
 
-func mapToProtoStruct(value map[string]any) *structpb.Struct {
+func mapToProtoStruct(value map[string]any) (*structpb.Struct, error) {
 	if len(value) == 0 {
-		return nil
+		return nil, nil
 	}
 	result, err := structpb.NewStruct(value)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
-	return result
+	return result, nil
 }
 
 func toProtoAppProfile(app store.App) *appsv1.AppProfile {

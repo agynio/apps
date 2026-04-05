@@ -21,9 +21,7 @@ plugins:
     include_imports: true
 
 inputs:
-  - git_repo: https://github.com/agynio/api.git
-    branch: noa/issue-89
-    subdir: proto
+  - module: buf.build/agynio/api
     paths:
       - agynio/api/apps/v1
       - agynio/api/authorization/v1
