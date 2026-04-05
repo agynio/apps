@@ -29,3 +29,17 @@ func validateName(name string) error {
 	}
 	return nil
 }
+
+func validatePermissions(permissions []string) error {
+	seen := make(map[string]struct{}, len(permissions))
+	for _, permission := range permissions {
+		if _, ok := permissionToRelation[permission]; !ok {
+			return fmt.Errorf("unknown permission %q", permission)
+		}
+		if _, dup := seen[permission]; dup {
+			return fmt.Errorf("duplicate permission %q", permission)
+		}
+		seen[permission] = struct{}{}
+	}
+	return nil
+}

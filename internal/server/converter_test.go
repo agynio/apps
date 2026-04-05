@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "github.com/agynio/apps/.gen/go/agynio/api/apps/v1"
 	"github.com/agynio/apps/internal/store"
 	"github.com/google/uuid"
 )
@@ -11,6 +12,7 @@ import (
 func TestToProtoApp(t *testing.T) {
 	appID := uuid.New()
 	identityID := uuid.New()
+	organizationID := uuid.New()
 	createdAt := time.Date(2024, 2, 3, 4, 5, 6, 0, time.UTC)
 	updatedAt := createdAt.Add(2 * time.Hour)
 	app := store.App{
@@ -26,6 +28,9 @@ func TestToProtoApp(t *testing.T) {
 		IdentityID:     identityID,
 		ZitiIdentityID: "ziti-id",
 		ZitiServiceID:  "ziti-service",
+		OrganizationID: organizationID,
+		Visibility:     store.AppVisibilityInternal,
+		Permissions:    []string{"thread:create"},
 	}
 
 	proto := toProtoApp(app)
@@ -43,6 +48,15 @@ func TestToProtoApp(t *testing.T) {
 	}
 	if proto.GetIdentityId() != identityID.String() {
 		t.Fatalf("expected identity id %s, got %s", identityID.String(), proto.GetIdentityId())
+	}
+	if proto.GetOrganizationId() != organizationID.String() {
+		t.Fatalf("expected organization id %s, got %s", organizationID.String(), proto.GetOrganizationId())
+	}
+	if proto.GetVisibility() != appsv1.AppVisibility_APP_VISIBILITY_INTERNAL {
+		t.Fatalf("expected internal visibility")
+	}
+	if len(proto.GetPermissions()) != 1 || proto.GetPermissions()[0] != "thread:create" {
+		t.Fatalf("expected permissions to match")
 	}
 }
 
