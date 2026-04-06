@@ -123,6 +123,15 @@ func (s *Server) CreateApp(ctx context.Context, req *appsv1.CreateAppRequest) (*
 		return nil, err
 	}
 
+	zitiServiceResp, err := s.zitiManagementClient.CreateService(ctx, &zitimanagementv1.CreateServiceRequest{
+		Name:           fmt.Sprintf("app-%s", slug),
+		RoleAttributes: []string{"app-services"},
+	})
+	if err != nil {
+		s.cleanupAuthorization(ctx, identityID)
+		return nil, status.Errorf(codes.Internal, "create ziti service: %v", err)
+	}
+
 	app, err := s.store.CreateApp(ctx, store.CreateAppInput{
 		ID:               appID,
 		OrganizationID:   organizationID,
@@ -133,11 +142,12 @@ func (s *Server) CreateApp(ctx context.Context, req *appsv1.CreateAppRequest) (*
 		IdentityID:       identityID,
 		ServiceTokenHash: tokenHash,
 		ZitiIdentityID:   "",
-		ZitiServiceID:    "",
+		ZitiServiceID:    zitiServiceResp.GetZitiServiceId(),
 		Visibility:       visibility,
 		Permissions:      permissions,
 	})
 	if err != nil {
+		s.cleanupZitiIdentity(ctx, identityID, zitiServiceResp.GetZitiServiceId())
 		s.cleanupAuthorization(ctx, identityID)
 		// TODO: clean up orphaned identity once Identity service supports deletion.
 		log.Printf("WARN: orphaned identity %s after store failure", identityID)
@@ -279,8 +289,8 @@ func (s *Server) DeleteApp(ctx context.Context, req *appsv1.DeleteAppRequest) (*
 		return nil, status.Error(codes.FailedPrecondition, "app has active installations")
 	}
 
-	if app.ZitiIdentityID != "" {
-		s.cleanupZitiIdentity(ctx, app.ZitiIdentityID, app.ZitiServiceID)
+	if app.ZitiServiceID != "" {
+		s.cleanupZitiIdentity(ctx, app.IdentityID, app.ZitiServiceID)
 	}
 	s.cleanupAuthorization(ctx, app.IdentityID)
 
@@ -328,10 +338,6 @@ func (s *Server) EnrollApp(ctx context.Context, req *appsv1.EnrollAppRequest) (*
 		return nil, toStatusError(err)
 	}
 
-	if app.ZitiIdentityID != "" {
-		s.cleanupZitiIdentity(ctx, app.ZitiIdentityID, app.ZitiServiceID)
-	}
-
 	zitiResp, err := s.zitiManagementClient.CreateAppIdentity(ctx, &zitimanagementv1.CreateAppIdentityRequest{
 		IdentityId: app.IdentityID.String(),
 		Slug:       app.Slug,
@@ -340,8 +346,8 @@ func (s *Server) EnrollApp(ctx context.Context, req *appsv1.EnrollAppRequest) (*
 		return nil, status.Errorf(codes.Internal, "create ziti identity: %v", err)
 	}
 
-	if err := s.store.UpdateAppZitiIdentity(ctx, app.Meta.ID, zitiResp.GetZitiIdentityId(), zitiResp.GetZitiServiceId()); err != nil {
-		s.cleanupZitiIdentity(ctx, zitiResp.GetZitiIdentityId(), zitiResp.GetZitiServiceId())
+	if err := s.store.UpdateAppZitiIdentity(ctx, app.Meta.ID, zitiResp.GetZitiIdentityId(), app.ZitiServiceID); err != nil {
+		s.cleanupZitiIdentity(ctx, app.IdentityID, app.ZitiServiceID)
 		return nil, status.Errorf(codes.Internal, "update ziti identity: %v", err)
 	}
 
@@ -670,12 +676,12 @@ func (s *Server) cleanupAuthorization(ctx context.Context, identityID uuid.UUID)
 	}
 }
 
-func (s *Server) cleanupZitiIdentity(ctx context.Context, zitiIdentityID string, zitiServiceID string) {
+func (s *Server) cleanupZitiIdentity(ctx context.Context, identityID uuid.UUID, zitiServiceID string) {
 	if _, err := s.zitiManagementClient.DeleteAppIdentity(ctx, &zitimanagementv1.DeleteAppIdentityRequest{
-		ZitiIdentityId: zitiIdentityID,
-		ZitiServiceId:  zitiServiceID,
+		IdentityId:    identityID.String(),
+		ZitiServiceId: zitiServiceID,
 	}); err != nil {
-		log.Printf("WARN: best-effort cleanup of ziti identity %s failed: %v", zitiIdentityID, err)
+		log.Printf("WARN: best-effort cleanup of ziti identity %s failed: %v", identityID, err)
 	}
 }
 
