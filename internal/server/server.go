@@ -147,6 +147,7 @@ func (s *Server) CreateApp(ctx context.Context, req *appsv1.CreateAppRequest) (*
 		Permissions:      permissions,
 	})
 	if err != nil {
+		s.cleanupZitiIdentity(ctx, identityID, zitiServiceResp.GetZitiServiceId())
 		s.cleanupAuthorization(ctx, identityID)
 		// TODO: clean up orphaned identity once Identity service supports deletion.
 		log.Printf("WARN: orphaned identity %s after store failure", identityID)

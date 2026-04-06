@@ -492,8 +492,14 @@ func TestCreateAppRollbackOnStoreError(t *testing.T) {
 	if len(zitiClient.createRequests) != 0 {
 		t.Fatalf("did not expect ziti create")
 	}
-	if len(zitiClient.deleteRequests) != 0 {
-		t.Fatalf("did not expect ziti cleanup")
+	if len(zitiClient.deleteRequests) != 1 {
+		t.Fatalf("expected ziti cleanup")
+	}
+	if zitiClient.deleteRequests[0].GetIdentityId() != store.createInputs[0].IdentityID.String() {
+		t.Fatalf("expected cleanup for identity %s", store.createInputs[0].IdentityID)
+	}
+	if zitiClient.deleteRequests[0].GetZitiServiceId() != "service-id" {
+		t.Fatalf("expected cleanup for ziti service")
 	}
 }
 
