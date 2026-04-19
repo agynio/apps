@@ -1233,6 +1233,37 @@ func TestGetInstallationRequiresMember(t *testing.T) {
 	}
 }
 
+func TestGetInstallationRejectsNonMember(t *testing.T) {
+	ctx, _ := newAdminContext()
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	installationID := uuid.New()
+	organizationID := uuid.New()
+	store.getInstallationFn = func(_ context.Context, _ uuid.UUID) (storepkg.Installation, error) {
+		return storepkg.Installation{
+			Meta:           storepkg.EntityMeta{ID: installationID, CreatedAt: time.Now(), UpdatedAt: time.Now()},
+			AppID:          uuid.New(),
+			OrganizationID: organizationID,
+			Slug:           "install",
+		}, nil
+	}
+	authorizationClient.checkFn = func(_ context.Context, _ *authorizationv1.CheckRequest) (*authorizationv1.CheckResponse, error) {
+		return &authorizationv1.CheckResponse{Allowed: false}, nil
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	_, err := srv.GetInstallation(ctx, &appsv1.GetInstallationRequest{Id: installationID.String()})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected permission denied, got %v", status.Code(err))
+	}
+	if len(authorizationClient.checkRequests) != 1 {
+		t.Fatalf("expected member check")
+	}
+}
+
 func TestGetInstallationBySlugRequiresMember(t *testing.T) {
 	ctx, callerID := newAdminContext()
 	identityClient := &fakeIdentityClient{}
@@ -1359,6 +1390,54 @@ func TestListInstallationsFiltersByMembership(t *testing.T) {
 		if check.GetTupleKey().GetUser() != fmt.Sprintf("identity:%s", callerID) {
 			t.Fatalf("expected user to be %s", callerID)
 		}
+	}
+}
+
+func TestListInstallationsCachesMembershipChecks(t *testing.T) {
+	ctx, callerID := newAdminContext()
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	organizationID := uuid.New()
+	store.listInstallationsFn = func(_ context.Context, _ int, _ string, _ storepkg.ListInstallationsFilter) ([]storepkg.Installation, string, error) {
+		return []storepkg.Installation{
+			{
+				Meta:           storepkg.EntityMeta{ID: uuid.New(), CreatedAt: time.Now(), UpdatedAt: time.Now()},
+				AppID:          uuid.New(),
+				OrganizationID: organizationID,
+				Slug:           "one",
+			},
+			{
+				Meta:           storepkg.EntityMeta{ID: uuid.New(), CreatedAt: time.Now(), UpdatedAt: time.Now()},
+				AppID:          uuid.New(),
+				OrganizationID: organizationID,
+				Slug:           "two",
+			},
+		}, "", nil
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	resp, err := srv.ListInstallations(ctx, &appsv1.ListInstallationsRequest{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(resp.GetInstallations()) != 2 {
+		t.Fatalf("expected two installations")
+	}
+	if len(authorizationClient.checkRequests) != 1 {
+		t.Fatalf("expected one membership check")
+	}
+	check := authorizationClient.checkRequests[0]
+	if check.GetTupleKey().GetRelation() != "member" {
+		t.Fatalf("expected member relation")
+	}
+	if check.GetTupleKey().GetUser() != fmt.Sprintf("identity:%s", callerID) {
+		t.Fatalf("expected user to be %s", callerID)
+	}
+	if check.GetTupleKey().GetObject() != fmt.Sprintf("organization:%s", organizationID) {
+		t.Fatalf("expected org check for %s", organizationID)
 	}
 }
 

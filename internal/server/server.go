@@ -525,11 +525,17 @@ func (s *Server) ListInstallations(ctx context.Context, req *appsv1.ListInstalla
 		return nil, status.Errorf(codes.Internal, "list installations: %v", err)
 	}
 	protoInstallations := make([]*appsv1.Installation, 0, len(installations))
+	orgAccess := map[uuid.UUID]bool{}
 	for _, installation := range installations {
 		if filter.OrganizationID == nil {
-			allowed, err := s.orgRelationAllowed(ctx, callerID, installation.OrganizationID, "member")
-			if err != nil {
-				return nil, err
+			allowed, ok := orgAccess[installation.OrganizationID]
+			if !ok {
+				var err error
+				allowed, err = s.orgRelationAllowed(ctx, callerID, installation.OrganizationID, "member")
+				if err != nil {
+					return nil, err
+				}
+				orgAccess[installation.OrganizationID] = allowed
 			}
 			if !allowed {
 				continue
