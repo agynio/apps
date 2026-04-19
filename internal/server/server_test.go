@@ -427,8 +427,8 @@ func TestCreateAppSuccess(t *testing.T) {
 	if identityClient.registerRequests[0].IdentityType != identityv1.IdentityType_IDENTITY_TYPE_APP {
 		t.Fatalf("expected identity type app")
 	}
-	if len(authorizationClient.writeRequests) != 1 || len(authorizationClient.writeRequests[0].Writes) != 1 {
-		t.Fatalf("expected authorization write")
+	if len(authorizationClient.writeRequests) != 0 {
+		t.Fatalf("did not expect authorization writes")
 	}
 	if len(zitiClient.createServiceRequests) != 1 {
 		t.Fatalf("expected ziti service create")
@@ -444,45 +444,6 @@ func TestCreateAppSuccess(t *testing.T) {
 	}
 	if len(zitiClient.deleteRequests) != 0 {
 		t.Fatalf("did not expect ziti delete")
-	}
-}
-
-func TestCreateAppRollbackOnAuthzWriteError(t *testing.T) {
-	ctx, _ := newAdminContext()
-	identityClient := &fakeIdentityClient{}
-	authorizationClient := &fakeAuthorizationClient{}
-	authorizationClient.writeFn = func(_ context.Context, _ *authorizationv1.WriteRequest) (*authorizationv1.WriteResponse, error) {
-		return nil, status.Error(codes.Internal, "authz down")
-	}
-	zitiClient := &fakeZitiManagementClient{}
-	store := &fakeStore{}
-	organizationID := uuid.New()
-
-	srv := New(store, identityClient, authorizationClient, zitiClient)
-	_, err := srv.CreateApp(ctx, &appsv1.CreateAppRequest{
-		OrganizationId: organizationID.String(),
-		Slug:           "demo",
-		Name:           "Demo",
-		Visibility:     appsv1.AppVisibility_APP_VISIBILITY_INTERNAL,
-		Permissions:    []string{"thread:create"},
-	})
-	if status.Code(err) != codes.Internal {
-		t.Fatalf("expected internal error, got %v", status.Code(err))
-	}
-	if len(identityClient.registerRequests) != 1 {
-		t.Fatalf("expected identity registration before authz failure")
-	}
-	if len(zitiClient.createServiceRequests) != 0 {
-		t.Fatalf("did not expect ziti service create")
-	}
-	if len(zitiClient.createRequests) != 0 {
-		t.Fatalf("did not expect ziti create")
-	}
-	if len(zitiClient.deleteRequests) != 0 {
-		t.Fatalf("did not expect ziti cleanup")
-	}
-	if len(store.createInputs) != 0 {
-		t.Fatalf("did not expect store create")
 	}
 }
 
@@ -511,11 +472,8 @@ func TestCreateAppRollbackOnStoreError(t *testing.T) {
 	if status.Code(err) != codes.AlreadyExists {
 		t.Fatalf("expected already exists, got %v", status.Code(err))
 	}
-	if len(authorizationClient.writeRequests) != 2 {
-		t.Fatalf("expected authz cleanup")
-	}
-	if len(authorizationClient.writeRequests[1].Deletes) != 1 {
-		t.Fatalf("expected authz delete in cleanup")
+	if len(authorizationClient.writeRequests) != 0 {
+		t.Fatalf("did not expect authorization writes")
 	}
 	if len(identityClient.registerRequests) != 1 {
 		t.Fatalf("expected identity registration before store failure")
@@ -572,9 +530,6 @@ func TestDeleteApp(t *testing.T) {
 	}
 	if zitiClient.deleteRequests[0].GetZitiServiceId() != "ziti-service" {
 		t.Fatalf("expected ziti service id cleanup")
-	}
-	if len(authorizationClient.writeRequests) != 1 || len(authorizationClient.writeRequests[0].Deletes) != 1 {
-		t.Fatalf("expected authz delete")
 	}
 	if len(store.deleteCalls) != 1 {
 		t.Fatalf("expected store delete")
@@ -660,9 +615,6 @@ func TestDeleteAppAllowsMissingZitiIdentity(t *testing.T) {
 	}
 	if len(store.deleteCalls) != 1 {
 		t.Fatalf("expected store delete")
-	}
-	if len(authorizationClient.writeRequests) != 1 {
-		t.Fatalf("expected authz cleanup")
 	}
 }
 
@@ -970,6 +922,220 @@ func TestUpdateAppSuccess(t *testing.T) {
 	}
 }
 
+func TestGetAppPublicSkipsMemberCheck(t *testing.T) {
+	ctx, _ := newAdminContext()
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	appID := uuid.New()
+	store.getFn = func(_ context.Context, _ uuid.UUID) (storepkg.App, error) {
+		return storepkg.App{
+			Meta:           storepkg.EntityMeta{ID: appID, CreatedAt: time.Now(), UpdatedAt: time.Now()},
+			Slug:           "public",
+			Name:           "Public",
+			OrganizationID: uuid.New(),
+			Visibility:     storepkg.AppVisibilityPublic,
+			IdentityID:     uuid.New(),
+		}, nil
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	_, err := srv.GetApp(ctx, &appsv1.GetAppRequest{Id: appID.String()})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(authorizationClient.checkRequests) != 0 {
+		t.Fatalf("did not expect authorization checks")
+	}
+}
+
+func TestGetAppInternalRequiresMember(t *testing.T) {
+	ctx, callerID := newAdminContext()
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	appID := uuid.New()
+	organizationID := uuid.New()
+	store.getFn = func(_ context.Context, _ uuid.UUID) (storepkg.App, error) {
+		return storepkg.App{
+			Meta:           storepkg.EntityMeta{ID: appID, CreatedAt: time.Now(), UpdatedAt: time.Now()},
+			Slug:           "internal",
+			Name:           "Internal",
+			OrganizationID: organizationID,
+			Visibility:     storepkg.AppVisibilityInternal,
+			IdentityID:     uuid.New(),
+		}, nil
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	_, err := srv.GetApp(ctx, &appsv1.GetAppRequest{Id: appID.String()})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(authorizationClient.checkRequests) != 1 {
+		t.Fatalf("expected member check")
+	}
+	check := authorizationClient.checkRequests[0]
+	if check.GetTupleKey().GetRelation() != "member" {
+		t.Fatalf("expected member relation")
+	}
+	if check.GetTupleKey().GetUser() != fmt.Sprintf("identity:%s", callerID) {
+		t.Fatalf("expected user to be %s", callerID)
+	}
+	if check.GetTupleKey().GetObject() != fmt.Sprintf("organization:%s", organizationID) {
+		t.Fatalf("expected org check for %s", organizationID)
+	}
+}
+
+func TestGetAppBySlugInternalRequiresMember(t *testing.T) {
+	ctx, callerID := newAdminContext()
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	appID := uuid.New()
+	organizationID := uuid.New()
+	store.getBySlugFn = func(_ context.Context, _ uuid.UUID, _ string) (storepkg.App, error) {
+		return storepkg.App{
+			Meta:           storepkg.EntityMeta{ID: appID, CreatedAt: time.Now(), UpdatedAt: time.Now()},
+			Slug:           "internal",
+			Name:           "Internal",
+			OrganizationID: organizationID,
+			Visibility:     storepkg.AppVisibilityInternal,
+			IdentityID:     uuid.New(),
+		}, nil
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	_, err := srv.GetAppBySlug(ctx, &appsv1.GetAppBySlugRequest{OrganizationId: organizationID.String(), Slug: "internal"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(authorizationClient.checkRequests) != 1 {
+		t.Fatalf("expected member check")
+	}
+	check := authorizationClient.checkRequests[0]
+	if check.GetTupleKey().GetRelation() != "member" {
+		t.Fatalf("expected member relation")
+	}
+	if check.GetTupleKey().GetUser() != fmt.Sprintf("identity:%s", callerID) {
+		t.Fatalf("expected user to be %s", callerID)
+	}
+	if check.GetTupleKey().GetObject() != fmt.Sprintf("organization:%s", organizationID) {
+		t.Fatalf("expected org check for %s", organizationID)
+	}
+}
+
+func TestGetAppProfileRequiresAuth(t *testing.T) {
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	_, err := srv.GetAppProfile(context.Background(), &appsv1.GetAppProfileRequest{IdentityId: uuid.New().String()})
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("expected unauthenticated, got %v", status.Code(err))
+	}
+}
+
+func TestListAppsDefaultsToPublic(t *testing.T) {
+	ctx, _ := newAdminContext()
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	store.listFn = func(_ context.Context, _ int, _ string, filter storepkg.ListAppsFilter) ([]storepkg.App, string, error) {
+		if filter.OrganizationID != nil {
+			return nil, "", errors.New("expected no org filter")
+		}
+		if filter.Visibility == nil || *filter.Visibility != storepkg.AppVisibilityPublic {
+			return nil, "", errors.New("expected public visibility")
+		}
+		return []storepkg.App{}, "", nil
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	resp, err := srv.ListApps(ctx, &appsv1.ListAppsRequest{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(resp.GetApps()) != 0 {
+		t.Fatalf("expected no apps")
+	}
+	if len(authorizationClient.checkRequests) != 0 {
+		t.Fatalf("did not expect authorization checks")
+	}
+}
+
+func TestListAppsRejectsInternalWithoutOrg(t *testing.T) {
+	ctx, _ := newAdminContext()
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+	called := false
+
+	store.listFn = func(_ context.Context, _ int, _ string, _ storepkg.ListAppsFilter) ([]storepkg.App, string, error) {
+		called = true
+		return []storepkg.App{}, "", nil
+	}
+
+	visibility := appsv1.AppVisibility_APP_VISIBILITY_INTERNAL
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	_, err := srv.ListApps(ctx, &appsv1.ListAppsRequest{Visibility: visibility})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected permission denied, got %v", status.Code(err))
+	}
+	if called {
+		t.Fatalf("did not expect store list")
+	}
+}
+
+func TestListAppsRequiresMemberForOrgFilter(t *testing.T) {
+	ctx, callerID := newAdminContext()
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	organizationID := uuid.New()
+	store.listFn = func(_ context.Context, _ int, _ string, filter storepkg.ListAppsFilter) ([]storepkg.App, string, error) {
+		if filter.OrganizationID == nil || *filter.OrganizationID != organizationID {
+			return nil, "", errors.New("expected org filter")
+		}
+		if filter.Visibility != nil {
+			return nil, "", errors.New("expected no visibility filter")
+		}
+		return []storepkg.App{}, "", nil
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	_, err := srv.ListApps(ctx, &appsv1.ListAppsRequest{OrganizationId: organizationID.String()})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(authorizationClient.checkRequests) != 1 {
+		t.Fatalf("expected member check")
+	}
+	check := authorizationClient.checkRequests[0]
+	if check.GetTupleKey().GetRelation() != "member" {
+		t.Fatalf("expected member relation")
+	}
+	if check.GetTupleKey().GetUser() != fmt.Sprintf("identity:%s", callerID) {
+		t.Fatalf("expected user to be %s", callerID)
+	}
+	if check.GetTupleKey().GetObject() != fmt.Sprintf("organization:%s", organizationID) {
+		t.Fatalf("expected org check for %s", organizationID)
+	}
+}
+
 func TestUpdateInstallationSuccess(t *testing.T) {
 	ctx, _ := newAdminContext()
 	identityClient := &fakeIdentityClient{}
@@ -1026,6 +1192,173 @@ func TestUpdateInstallationSuccess(t *testing.T) {
 	}
 	if resp.GetInstallation().GetConfiguration().AsMap()["region"] != "us-east" {
 		t.Fatalf("expected response configuration")
+	}
+}
+
+func TestGetInstallationRequiresMember(t *testing.T) {
+	ctx, callerID := newAdminContext()
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	installationID := uuid.New()
+	organizationID := uuid.New()
+	store.getInstallationFn = func(_ context.Context, _ uuid.UUID) (storepkg.Installation, error) {
+		return storepkg.Installation{
+			Meta:           storepkg.EntityMeta{ID: installationID, CreatedAt: time.Now(), UpdatedAt: time.Now()},
+			AppID:          uuid.New(),
+			OrganizationID: organizationID,
+			Slug:           "install",
+		}, nil
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	_, err := srv.GetInstallation(ctx, &appsv1.GetInstallationRequest{Id: installationID.String()})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(authorizationClient.checkRequests) != 1 {
+		t.Fatalf("expected member check")
+	}
+	check := authorizationClient.checkRequests[0]
+	if check.GetTupleKey().GetRelation() != "member" {
+		t.Fatalf("expected member relation")
+	}
+	if check.GetTupleKey().GetUser() != fmt.Sprintf("identity:%s", callerID) {
+		t.Fatalf("expected user to be %s", callerID)
+	}
+	if check.GetTupleKey().GetObject() != fmt.Sprintf("organization:%s", organizationID) {
+		t.Fatalf("expected org check for %s", organizationID)
+	}
+}
+
+func TestGetInstallationBySlugRequiresMember(t *testing.T) {
+	ctx, callerID := newAdminContext()
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	installationID := uuid.New()
+	organizationID := uuid.New()
+	store.getInstallationBySlugFn = func(_ context.Context, _ uuid.UUID, _ string) (storepkg.Installation, error) {
+		return storepkg.Installation{
+			Meta:           storepkg.EntityMeta{ID: installationID, CreatedAt: time.Now(), UpdatedAt: time.Now()},
+			AppID:          uuid.New(),
+			OrganizationID: organizationID,
+			Slug:           "install",
+		}, nil
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	_, err := srv.GetInstallationBySlug(ctx, &appsv1.GetInstallationBySlugRequest{OrganizationId: organizationID.String(), Slug: "install"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(authorizationClient.checkRequests) != 1 {
+		t.Fatalf("expected member check")
+	}
+	check := authorizationClient.checkRequests[0]
+	if check.GetTupleKey().GetRelation() != "member" {
+		t.Fatalf("expected member relation")
+	}
+	if check.GetTupleKey().GetUser() != fmt.Sprintf("identity:%s", callerID) {
+		t.Fatalf("expected user to be %s", callerID)
+	}
+	if check.GetTupleKey().GetObject() != fmt.Sprintf("organization:%s", organizationID) {
+		t.Fatalf("expected org check for %s", organizationID)
+	}
+}
+
+func TestListInstallationsRequiresMemberForOrgFilter(t *testing.T) {
+	ctx, callerID := newAdminContext()
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	organizationID := uuid.New()
+	store.listInstallationsFn = func(_ context.Context, _ int, _ string, filter storepkg.ListInstallationsFilter) ([]storepkg.Installation, string, error) {
+		if filter.OrganizationID == nil || *filter.OrganizationID != organizationID {
+			return nil, "", errors.New("expected org filter")
+		}
+		return []storepkg.Installation{}, "", nil
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	_, err := srv.ListInstallations(ctx, &appsv1.ListInstallationsRequest{OrganizationId: organizationID.String()})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(authorizationClient.checkRequests) != 1 {
+		t.Fatalf("expected member check")
+	}
+	check := authorizationClient.checkRequests[0]
+	if check.GetTupleKey().GetRelation() != "member" {
+		t.Fatalf("expected member relation")
+	}
+	if check.GetTupleKey().GetUser() != fmt.Sprintf("identity:%s", callerID) {
+		t.Fatalf("expected user to be %s", callerID)
+	}
+	if check.GetTupleKey().GetObject() != fmt.Sprintf("organization:%s", organizationID) {
+		t.Fatalf("expected org check for %s", organizationID)
+	}
+}
+
+func TestListInstallationsFiltersByMembership(t *testing.T) {
+	ctx, callerID := newAdminContext()
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	allowedOrg := uuid.New()
+	blockedOrg := uuid.New()
+	store.listInstallationsFn = func(_ context.Context, _ int, _ string, _ storepkg.ListInstallationsFilter) ([]storepkg.Installation, string, error) {
+		return []storepkg.Installation{
+			{
+				Meta:           storepkg.EntityMeta{ID: uuid.New(), CreatedAt: time.Now(), UpdatedAt: time.Now()},
+				AppID:          uuid.New(),
+				OrganizationID: allowedOrg,
+				Slug:           "allowed",
+			},
+			{
+				Meta:           storepkg.EntityMeta{ID: uuid.New(), CreatedAt: time.Now(), UpdatedAt: time.Now()},
+				AppID:          uuid.New(),
+				OrganizationID: blockedOrg,
+				Slug:           "blocked",
+			},
+		}, "", nil
+	}
+	authorizationClient.checkFn = func(_ context.Context, req *authorizationv1.CheckRequest) (*authorizationv1.CheckResponse, error) {
+		if req.GetTupleKey().GetObject() == fmt.Sprintf("organization:%s", allowedOrg) {
+			return &authorizationv1.CheckResponse{Allowed: true}, nil
+		}
+		return &authorizationv1.CheckResponse{Allowed: false}, nil
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	resp, err := srv.ListInstallations(ctx, &appsv1.ListInstallationsRequest{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(resp.GetInstallations()) != 1 {
+		t.Fatalf("expected one authorized installation")
+	}
+	if resp.GetInstallations()[0].GetOrganizationId() != allowedOrg.String() {
+		t.Fatalf("expected installation for org %s", allowedOrg)
+	}
+	if len(authorizationClient.checkRequests) != 2 {
+		t.Fatalf("expected membership checks for both orgs")
+	}
+	for _, check := range authorizationClient.checkRequests {
+		if check.GetTupleKey().GetRelation() != "member" {
+			t.Fatalf("expected member relation")
+		}
+		if check.GetTupleKey().GetUser() != fmt.Sprintf("identity:%s", callerID) {
+			t.Fatalf("expected user to be %s", callerID)
+		}
 	}
 }
 
@@ -1107,6 +1440,67 @@ func TestInstallAppDefaultsSlug(t *testing.T) {
 	}
 	if resp.GetInstallation().GetSlug() != "demo" {
 		t.Fatalf("expected response slug to be defaulted")
+	}
+}
+
+func TestInstallAppWritesPermissionTuples(t *testing.T) {
+	ctx, _ := newAdminContext()
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	appID := uuid.New()
+	organizationID := uuid.New()
+	appIdentityID := uuid.New()
+	store.getFn = func(_ context.Context, _ uuid.UUID) (storepkg.App, error) {
+		return storepkg.App{
+			Meta:           storepkg.EntityMeta{ID: appID},
+			Slug:           "demo",
+			OrganizationID: organizationID,
+			Visibility:     storepkg.AppVisibilityInternal,
+			IdentityID:     appIdentityID,
+			Permissions:    []string{"thread:create", "thread:write", "participant:add"},
+		}, nil
+	}
+	store.createInstallationFn = func(_ context.Context, input storepkg.CreateInstallationInput) (storepkg.Installation, error) {
+		return storepkg.Installation{
+			Meta:           storepkg.EntityMeta{ID: input.ID, CreatedAt: time.Now(), UpdatedAt: time.Now()},
+			AppID:          input.AppID,
+			OrganizationID: input.OrganizationID,
+			Slug:           input.Slug,
+			Configuration:  input.Configuration,
+		}, nil
+	}
+	authorizationClient.writeFn = func(_ context.Context, req *authorizationv1.WriteRequest) (*authorizationv1.WriteResponse, error) {
+		if len(req.Writes) != 3 {
+			return nil, errors.New("expected three permission tuples")
+		}
+		relations := map[string]bool{}
+		for _, tuple := range req.Writes {
+			if tuple.GetUser() != fmt.Sprintf("identity:%s", appIdentityID) {
+				return nil, fmt.Errorf("unexpected user %s", tuple.GetUser())
+			}
+			if tuple.GetObject() != fmt.Sprintf("organization:%s", organizationID) {
+				return nil, fmt.Errorf("unexpected object %s", tuple.GetObject())
+			}
+			relations[tuple.GetRelation()] = true
+		}
+		for _, relation := range []string{"thread_create", "thread_write", "participant_add"} {
+			if !relations[relation] {
+				return nil, fmt.Errorf("missing relation %s", relation)
+			}
+		}
+		return &authorizationv1.WriteResponse{}, nil
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	_, err := srv.InstallApp(ctx, &appsv1.InstallAppRequest{AppId: appID.String(), OrganizationId: organizationID.String()})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(authorizationClient.writeRequests) != 1 {
+		t.Fatalf("expected permission tuples to be written")
 	}
 }
 
@@ -1199,6 +1593,9 @@ func TestUninstallAppDeletesTuplesBeforeStore(t *testing.T) {
 	authorizationClient.writeFn = func(_ context.Context, req *authorizationv1.WriteRequest) (*authorizationv1.WriteResponse, error) {
 		if len(req.Deletes) != 1 {
 			return nil, errors.New("expected delete tuples")
+		}
+		if req.Deletes[0].GetRelation() != "thread_create" {
+			return nil, errors.New("expected thread_create relation")
 		}
 		order = append(order, "auth")
 		return &authorizationv1.WriteResponse{}, nil
