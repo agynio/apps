@@ -21,15 +21,13 @@ import (
 )
 
 const (
-	clusterObject            = "cluster:global"
-	clusterAppWriterRelation = "writer"
-	identityMetadata         = "x-identity-id"
+	identityMetadata = "x-identity-id"
 )
 
 var permissionToRelation = map[string]string{
-	"thread:create":   "can_create_thread",
-	"thread:write":    "can_write_thread",
-	"participant:add": "can_add_participant",
+	"thread:create":   "thread_create",
+	"thread:write":    "thread_write",
+	"participant:add": "participant_add",
 }
 
 type AppStore interface {
@@ -117,18 +115,11 @@ func (s *Server) CreateApp(ctx context.Context, req *appsv1.CreateAppRequest) (*
 		return nil, status.Errorf(codes.Internal, "register identity: %v", err)
 	}
 
-	if err := s.writeAppAuthorization(ctx, identityID); err != nil {
-		// TODO: clean up orphaned identity once Identity service supports deletion.
-		log.Printf("WARN: orphaned identity %s after authorization failure", identityID)
-		return nil, err
-	}
-
 	zitiServiceResp, err := s.zitiManagementClient.CreateService(ctx, &zitimanagementv1.CreateServiceRequest{
 		Name:           fmt.Sprintf("app-%s", slug),
 		RoleAttributes: []string{"app-services"},
 	})
 	if err != nil {
-		s.cleanupAuthorization(ctx, identityID)
 		return nil, status.Errorf(codes.Internal, "create ziti service: %v", err)
 	}
 
@@ -148,7 +139,6 @@ func (s *Server) CreateApp(ctx context.Context, req *appsv1.CreateAppRequest) (*
 	})
 	if err != nil {
 		s.cleanupZitiIdentity(ctx, identityID, zitiServiceResp.GetZitiServiceId())
-		s.cleanupAuthorization(ctx, identityID)
 		// TODO: clean up orphaned identity once Identity service supports deletion.
 		log.Printf("WARN: orphaned identity %s after store failure", identityID)
 		return nil, toStatusError(err)
@@ -206,6 +196,10 @@ func (s *Server) UpdateApp(ctx context.Context, req *appsv1.UpdateAppRequest) (*
 }
 
 func (s *Server) GetApp(ctx context.Context, req *appsv1.GetAppRequest) (*appsv1.GetAppResponse, error) {
+	callerID, err := identityFromMetadata(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Unauthenticated, "unauthenticated: %v", err)
+	}
 	id, err := parseUUID(req.GetId())
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "id: %v", err)
@@ -214,10 +208,19 @@ func (s *Server) GetApp(ctx context.Context, req *appsv1.GetAppRequest) (*appsv1
 	if err != nil {
 		return nil, toStatusError(err)
 	}
+	if app.Visibility == store.AppVisibilityInternal {
+		if err := s.requireOrgMember(ctx, callerID, app.OrganizationID); err != nil {
+			return nil, err
+		}
+	}
 	return &appsv1.GetAppResponse{App: toProtoApp(app)}, nil
 }
 
 func (s *Server) GetAppBySlug(ctx context.Context, req *appsv1.GetAppBySlugRequest) (*appsv1.GetAppBySlugResponse, error) {
+	callerID, err := identityFromMetadata(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Unauthenticated, "unauthenticated: %v", err)
+	}
 	organizationID, err := parseUUID(req.GetOrganizationId())
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "organization_id: %v", err)
@@ -230,15 +233,27 @@ func (s *Server) GetAppBySlug(ctx context.Context, req *appsv1.GetAppBySlugReque
 	if err != nil {
 		return nil, toStatusError(err)
 	}
+	if app.Visibility == store.AppVisibilityInternal {
+		if err := s.requireOrgMember(ctx, callerID, app.OrganizationID); err != nil {
+			return nil, err
+		}
+	}
 	return &appsv1.GetAppBySlugResponse{App: toProtoApp(app)}, nil
 }
 
 func (s *Server) ListApps(ctx context.Context, req *appsv1.ListAppsRequest) (*appsv1.ListAppsResponse, error) {
+	callerID, err := identityFromMetadata(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Unauthenticated, "unauthenticated: %v", err)
+	}
 	filter := store.ListAppsFilter{}
 	if req.GetOrganizationId() != "" {
 		organizationID, err := parseUUID(req.GetOrganizationId())
 		if err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "organization_id: %v", err)
+		}
+		if err := s.requireOrgMember(ctx, callerID, organizationID); err != nil {
+			return nil, err
 		}
 		filter.OrganizationID = &organizationID
 	}
@@ -248,6 +263,14 @@ func (s *Server) ListApps(ctx context.Context, req *appsv1.ListAppsRequest) (*ap
 			return nil, status.Errorf(codes.InvalidArgument, "visibility: %v", err)
 		}
 		filter.Visibility = &visibility
+	}
+	if filter.OrganizationID == nil {
+		if filter.Visibility == nil {
+			visibility := store.AppVisibilityPublic
+			filter.Visibility = &visibility
+		} else if *filter.Visibility != store.AppVisibilityPublic {
+			return nil, status.Error(codes.PermissionDenied, "permission denied")
+		}
 	}
 
 	apps, nextToken, err := s.store.ListApps(ctx, int(req.GetPageSize()), req.GetPageToken(), filter)
@@ -294,7 +317,6 @@ func (s *Server) DeleteApp(ctx context.Context, req *appsv1.DeleteAppRequest) (*
 			return nil, status.Errorf(codes.Internal, "delete ziti identity: %v", err)
 		}
 	}
-	s.cleanupAuthorization(ctx, app.IdentityID)
 
 	if err := s.store.DeleteApp(ctx, id); err != nil {
 		return nil, toStatusError(err)
@@ -303,6 +325,9 @@ func (s *Server) DeleteApp(ctx context.Context, req *appsv1.DeleteAppRequest) (*
 }
 
 func (s *Server) GetAppProfile(ctx context.Context, req *appsv1.GetAppProfileRequest) (*appsv1.GetAppProfileResponse, error) {
+	if _, err := identityFromMetadata(ctx); err != nil {
+		return nil, status.Errorf(codes.Unauthenticated, "unauthenticated: %v", err)
+	}
 	identityID, err := parseUUID(req.GetIdentityId())
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "identity_id: %v", err)
@@ -418,6 +443,10 @@ func (s *Server) InstallApp(ctx context.Context, req *appsv1.InstallAppRequest) 
 }
 
 func (s *Server) GetInstallation(ctx context.Context, req *appsv1.GetInstallationRequest) (*appsv1.GetInstallationResponse, error) {
+	callerID, err := identityFromMetadata(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Unauthenticated, "unauthenticated: %v", err)
+	}
 	id, err := parseUUID(req.GetId())
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "id: %v", err)
@@ -425,6 +454,9 @@ func (s *Server) GetInstallation(ctx context.Context, req *appsv1.GetInstallatio
 	installation, err := s.store.GetInstallation(ctx, id)
 	if err != nil {
 		return nil, toStatusError(err)
+	}
+	if err := s.requireOrgMember(ctx, callerID, installation.OrganizationID); err != nil {
+		return nil, err
 	}
 	protoInstallation, err := toProtoInstallation(installation)
 	if err != nil {
@@ -434,6 +466,10 @@ func (s *Server) GetInstallation(ctx context.Context, req *appsv1.GetInstallatio
 }
 
 func (s *Server) GetInstallationBySlug(ctx context.Context, req *appsv1.GetInstallationBySlugRequest) (*appsv1.GetInstallationBySlugResponse, error) {
+	callerID, err := identityFromMetadata(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Unauthenticated, "unauthenticated: %v", err)
+	}
 	organizationID, err := parseUUID(req.GetOrganizationId())
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "organization_id: %v", err)
@@ -446,6 +482,9 @@ func (s *Server) GetInstallationBySlug(ctx context.Context, req *appsv1.GetInsta
 	if err != nil {
 		return nil, toStatusError(err)
 	}
+	if err := s.requireOrgMember(ctx, callerID, installation.OrganizationID); err != nil {
+		return nil, err
+	}
 	protoInstallation, err := toProtoInstallation(installation)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "convert installation: %v", err)
@@ -454,11 +493,18 @@ func (s *Server) GetInstallationBySlug(ctx context.Context, req *appsv1.GetInsta
 }
 
 func (s *Server) ListInstallations(ctx context.Context, req *appsv1.ListInstallationsRequest) (*appsv1.ListInstallationsResponse, error) {
+	callerID, err := identityFromMetadata(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Unauthenticated, "unauthenticated: %v", err)
+	}
 	filter := store.ListInstallationsFilter{}
 	if req.GetOrganizationId() != "" {
 		organizationID, err := parseUUID(req.GetOrganizationId())
 		if err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "organization_id: %v", err)
+		}
+		if err := s.requireOrgMember(ctx, callerID, organizationID); err != nil {
+			return nil, err
 		}
 		filter.OrganizationID = &organizationID
 	}
@@ -479,7 +525,22 @@ func (s *Server) ListInstallations(ctx context.Context, req *appsv1.ListInstalla
 		return nil, status.Errorf(codes.Internal, "list installations: %v", err)
 	}
 	protoInstallations := make([]*appsv1.Installation, 0, len(installations))
+	orgAccess := map[uuid.UUID]bool{}
 	for _, installation := range installations {
+		if filter.OrganizationID == nil {
+			allowed, ok := orgAccess[installation.OrganizationID]
+			if !ok {
+				var err error
+				allowed, err = s.orgRelationAllowed(ctx, callerID, installation.OrganizationID, "member")
+				if err != nil {
+					return nil, err
+				}
+				orgAccess[installation.OrganizationID] = allowed
+			}
+			if !allowed {
+				continue
+			}
+		}
 		protoInstallation, err := toProtoInstallation(installation)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "convert installation: %v", err)
@@ -585,36 +646,39 @@ func (s *Server) GetInstallationConfiguration(ctx context.Context, req *appsv1.G
 }
 
 func (s *Server) requireOrgOwner(ctx context.Context, identityID uuid.UUID, organizationID uuid.UUID) error {
-	resp, err := s.authorizationClient.Check(ctx, &authorizationv1.CheckRequest{
-		TupleKey: &authorizationv1.TupleKey{
-			User:     fmt.Sprintf("identity:%s", identityID.String()),
-			Relation: "owner",
-			Object:   fmt.Sprintf("organization:%s", organizationID.String()),
-		},
-	})
+	allowed, err := s.orgRelationAllowed(ctx, identityID, organizationID, "owner")
 	if err != nil {
-		return status.Errorf(codes.Internal, "authorization check: %v", err)
+		return err
 	}
-	if !resp.GetAllowed() {
+	if !allowed {
 		return status.Error(codes.PermissionDenied, "permission denied")
 	}
 	return nil
 }
 
-func (s *Server) writeAppAuthorization(ctx context.Context, identityID uuid.UUID) error {
-	_, err := s.authorizationClient.Write(ctx, &authorizationv1.WriteRequest{
-		Writes: []*authorizationv1.TupleKey{
-			{
-				User:     fmt.Sprintf("identity:%s", identityID.String()),
-				Relation: clusterAppWriterRelation,
-				Object:   clusterObject,
-			},
+func (s *Server) requireOrgMember(ctx context.Context, identityID uuid.UUID, organizationID uuid.UUID) error {
+	allowed, err := s.orgRelationAllowed(ctx, identityID, organizationID, "member")
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return status.Error(codes.PermissionDenied, "permission denied")
+	}
+	return nil
+}
+
+func (s *Server) orgRelationAllowed(ctx context.Context, identityID uuid.UUID, organizationID uuid.UUID, relation string) (bool, error) {
+	resp, err := s.authorizationClient.Check(ctx, &authorizationv1.CheckRequest{
+		TupleKey: &authorizationv1.TupleKey{
+			User:     fmt.Sprintf("identity:%s", identityID.String()),
+			Relation: relation,
+			Object:   fmt.Sprintf("organization:%s", organizationID.String()),
 		},
 	})
 	if err != nil {
-		return status.Errorf(codes.Internal, "authorization write: %v", err)
+		return false, status.Errorf(codes.Internal, "authorization check: %v", err)
 	}
-	return nil
+	return resp.GetAllowed(), nil
 }
 
 func (s *Server) writeInstallationTuples(ctx context.Context, app store.App, organizationID uuid.UUID) error {
@@ -661,20 +725,6 @@ func (s *Server) deleteInstallationTuples(ctx context.Context, app store.App, or
 	}
 	if _, err := s.authorizationClient.Write(ctx, &authorizationv1.WriteRequest{Deletes: tuples}); err != nil {
 		log.Printf("WARN: best-effort cleanup of installation tuples for org %s failed: %v", organizationID, err)
-	}
-}
-
-func (s *Server) cleanupAuthorization(ctx context.Context, identityID uuid.UUID) {
-	if _, err := s.authorizationClient.Write(ctx, &authorizationv1.WriteRequest{
-		Deletes: []*authorizationv1.TupleKey{
-			{
-				User:     fmt.Sprintf("identity:%s", identityID.String()),
-				Relation: clusterAppWriterRelation,
-				Object:   clusterObject,
-			},
-		},
-	}); err != nil {
-		log.Printf("WARN: best-effort cleanup of authz tuple for identity %s failed: %v", identityID, err)
 	}
 }
 
