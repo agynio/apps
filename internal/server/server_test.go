@@ -42,6 +42,7 @@ type fakeStore struct {
 	createInstallationInputs []storepkg.CreateInstallationInput
 	updateInstallationInputs []storepkg.UpdateInstallationInput
 	deleteInstallationCalls  []uuid.UUID
+	deleteCalls              []uuid.UUID
 	getCalls                 []uuid.UUID
 	getByServiceTokenCalls   []string
 	updateZitiCalls          []updateZitiCall
@@ -107,6 +108,7 @@ func (f *fakeStore) ListApps(ctx context.Context, pageSize int, pageToken string
 }
 
 func (f *fakeStore) DeleteApp(ctx context.Context, id uuid.UUID) error {
+	f.deleteCalls = append(f.deleteCalls, id)
 	if f.deleteFn != nil {
 		return f.deleteFn(ctx, id)
 	}
@@ -195,6 +197,18 @@ func (f *fakeIdentityClient) GetIdentityType(ctx context.Context, _ *identityv1.
 }
 
 func (f *fakeIdentityClient) BatchGetIdentityTypes(ctx context.Context, _ *identityv1.BatchGetIdentityTypesRequest, _ ...grpc.CallOption) (*identityv1.BatchGetIdentityTypesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "not implemented")
+}
+
+func (f *fakeIdentityClient) SetNickname(ctx context.Context, _ *identityv1.SetNicknameRequest, _ ...grpc.CallOption) (*identityv1.SetNicknameResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "not implemented")
+}
+
+func (f *fakeIdentityClient) RemoveNickname(ctx context.Context, _ *identityv1.RemoveNicknameRequest, _ ...grpc.CallOption) (*identityv1.RemoveNicknameResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "not implemented")
+}
+
+func (f *fakeIdentityClient) ResolveNickname(ctx context.Context, _ *identityv1.ResolveNicknameRequest, _ ...grpc.CallOption) (*identityv1.ResolveNicknameResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "not implemented")
 }
 
@@ -299,6 +313,26 @@ func (f *fakeZitiManagementClient) RequestServiceIdentity(ctx context.Context, _
 }
 
 func (f *fakeZitiManagementClient) ExtendIdentityLease(ctx context.Context, _ *zitimanagementv1.ExtendIdentityLeaseRequest, _ ...grpc.CallOption) (*zitimanagementv1.ExtendIdentityLeaseResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "not implemented")
+}
+
+func (f *fakeZitiManagementClient) CreateServicePolicy(ctx context.Context, _ *zitimanagementv1.CreateServicePolicyRequest, _ ...grpc.CallOption) (*zitimanagementv1.CreateServicePolicyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "not implemented")
+}
+
+func (f *fakeZitiManagementClient) DeleteServicePolicy(ctx context.Context, _ *zitimanagementv1.DeleteServicePolicyRequest, _ ...grpc.CallOption) (*zitimanagementv1.DeleteServicePolicyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "not implemented")
+}
+
+func (f *fakeZitiManagementClient) DeleteService(ctx context.Context, _ *zitimanagementv1.DeleteServiceRequest, _ ...grpc.CallOption) (*zitimanagementv1.DeleteServiceResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "not implemented")
+}
+
+func (f *fakeZitiManagementClient) CreateDeviceIdentity(ctx context.Context, _ *zitimanagementv1.CreateDeviceIdentityRequest, _ ...grpc.CallOption) (*zitimanagementv1.CreateDeviceIdentityResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "not implemented")
+}
+
+func (f *fakeZitiManagementClient) DeleteDeviceIdentity(ctx context.Context, _ *zitimanagementv1.DeleteDeviceIdentityRequest, _ ...grpc.CallOption) (*zitimanagementv1.DeleteDeviceIdentityResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "not implemented")
 }
 
@@ -541,6 +575,94 @@ func TestDeleteApp(t *testing.T) {
 	}
 	if len(authorizationClient.writeRequests) != 1 || len(authorizationClient.writeRequests[0].Deletes) != 1 {
 		t.Fatalf("expected authz delete")
+	}
+	if len(store.deleteCalls) != 1 {
+		t.Fatalf("expected store delete")
+	}
+	if store.deleteCalls[0] != appID {
+		t.Fatalf("expected store delete for %s", appID)
+	}
+}
+
+func TestDeleteAppFailsWhenZitiCleanupFails(t *testing.T) {
+	ctx, _ := newAdminContext()
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	appID := uuid.New()
+	identityID := uuid.New()
+	organizationID := uuid.New()
+
+	store := &fakeStore{}
+	store.getFn = func(_ context.Context, _ uuid.UUID) (storepkg.App, error) {
+		return storepkg.App{
+			Meta:           storepkg.EntityMeta{ID: appID},
+			IdentityID:     identityID,
+			ZitiIdentityID: "ziti-id",
+			ZitiServiceID:  "ziti-service",
+			OrganizationID: organizationID,
+		}, nil
+	}
+	store.hasActiveInstallationsFn = func(_ context.Context, _ uuid.UUID) (bool, error) { return false, nil }
+	store.deleteFn = func(_ context.Context, _ uuid.UUID) error { return nil }
+	zitiClient.deleteFn = func(_ context.Context, _ *zitimanagementv1.DeleteAppIdentityRequest) (*zitimanagementv1.DeleteAppIdentityResponse, error) {
+		return nil, errors.New("ziti cleanup failed")
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	_, err := srv.DeleteApp(ctx, &appsv1.DeleteAppRequest{Id: appID.String()})
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("expected internal error, got %v", status.Code(err))
+	}
+	if len(zitiClient.deleteRequests) != 1 {
+		t.Fatalf("expected ziti delete")
+	}
+	if len(store.deleteCalls) != 0 {
+		t.Fatalf("expected store delete to be skipped")
+	}
+	if len(authorizationClient.writeRequests) != 0 {
+		t.Fatalf("expected authz cleanup to be skipped")
+	}
+}
+
+func TestDeleteAppAllowsMissingZitiIdentity(t *testing.T) {
+	ctx, _ := newAdminContext()
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	appID := uuid.New()
+	identityID := uuid.New()
+	organizationID := uuid.New()
+
+	store := &fakeStore{}
+	store.getFn = func(_ context.Context, _ uuid.UUID) (storepkg.App, error) {
+		return storepkg.App{
+			Meta:           storepkg.EntityMeta{ID: appID},
+			IdentityID:     identityID,
+			ZitiIdentityID: "ziti-id",
+			ZitiServiceID:  "ziti-service",
+			OrganizationID: organizationID,
+		}, nil
+	}
+	store.hasActiveInstallationsFn = func(_ context.Context, _ uuid.UUID) (bool, error) { return false, nil }
+	store.deleteFn = func(_ context.Context, _ uuid.UUID) error { return nil }
+	zitiClient.deleteFn = func(_ context.Context, _ *zitimanagementv1.DeleteAppIdentityRequest) (*zitimanagementv1.DeleteAppIdentityResponse, error) {
+		return nil, status.Error(codes.NotFound, "not found")
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	_, err := srv.DeleteApp(ctx, &appsv1.DeleteAppRequest{Id: appID.String()})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(zitiClient.deleteRequests) != 1 {
+		t.Fatalf("expected ziti delete")
+	}
+	if len(store.deleteCalls) != 1 {
+		t.Fatalf("expected store delete")
+	}
+	if len(authorizationClient.writeRequests) != 1 {
+		t.Fatalf("expected authz cleanup")
 	}
 }
 
