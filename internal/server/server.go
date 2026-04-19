@@ -689,6 +689,12 @@ func (s *Server) deleteZitiIdentity(ctx context.Context, identityID uuid.UUID, z
 		IdentityId:    identityID.String(),
 		ZitiServiceId: zitiServiceID,
 	})
+	if err == nil {
+		return nil
+	}
+	if status.Code(err) == codes.NotFound {
+		return nil
+	}
 	return err
 }
 

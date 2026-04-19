@@ -620,6 +620,50 @@ func TestDeleteAppFailsWhenZitiCleanupFails(t *testing.T) {
 	if len(store.deleteCalls) != 0 {
 		t.Fatalf("expected store delete to be skipped")
 	}
+	if len(authorizationClient.writeRequests) != 0 {
+		t.Fatalf("expected authz cleanup to be skipped")
+	}
+}
+
+func TestDeleteAppAllowsMissingZitiIdentity(t *testing.T) {
+	ctx, _ := newAdminContext()
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	appID := uuid.New()
+	identityID := uuid.New()
+	organizationID := uuid.New()
+
+	store := &fakeStore{}
+	store.getFn = func(_ context.Context, _ uuid.UUID) (storepkg.App, error) {
+		return storepkg.App{
+			Meta:           storepkg.EntityMeta{ID: appID},
+			IdentityID:     identityID,
+			ZitiIdentityID: "ziti-id",
+			ZitiServiceID:  "ziti-service",
+			OrganizationID: organizationID,
+		}, nil
+	}
+	store.hasActiveInstallationsFn = func(_ context.Context, _ uuid.UUID) (bool, error) { return false, nil }
+	store.deleteFn = func(_ context.Context, _ uuid.UUID) error { return nil }
+	zitiClient.deleteFn = func(_ context.Context, _ *zitimanagementv1.DeleteAppIdentityRequest) (*zitimanagementv1.DeleteAppIdentityResponse, error) {
+		return nil, status.Error(codes.NotFound, "not found")
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	_, err := srv.DeleteApp(ctx, &appsv1.DeleteAppRequest{Id: appID.String()})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(zitiClient.deleteRequests) != 1 {
+		t.Fatalf("expected ziti delete")
+	}
+	if len(store.deleteCalls) != 1 {
+		t.Fatalf("expected store delete")
+	}
+	if len(authorizationClient.writeRequests) != 1 {
+		t.Fatalf("expected authz cleanup")
+	}
 }
 
 func TestValidateServiceTokenHashesServerSide(t *testing.T) {
