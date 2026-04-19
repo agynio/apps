@@ -290,7 +290,9 @@ func (s *Server) DeleteApp(ctx context.Context, req *appsv1.DeleteAppRequest) (*
 	}
 
 	if app.ZitiServiceID != "" {
-		s.cleanupZitiIdentity(ctx, app.IdentityID, app.ZitiServiceID)
+		if err := s.deleteZitiIdentity(ctx, app.IdentityID, app.ZitiServiceID); err != nil {
+			return nil, status.Errorf(codes.Internal, "delete ziti identity: %v", err)
+		}
 	}
 	s.cleanupAuthorization(ctx, app.IdentityID)
 
@@ -677,12 +679,17 @@ func (s *Server) cleanupAuthorization(ctx context.Context, identityID uuid.UUID)
 }
 
 func (s *Server) cleanupZitiIdentity(ctx context.Context, identityID uuid.UUID, zitiServiceID string) {
-	if _, err := s.zitiManagementClient.DeleteAppIdentity(ctx, &zitimanagementv1.DeleteAppIdentityRequest{
-		IdentityId:    identityID.String(),
-		ZitiServiceId: zitiServiceID,
-	}); err != nil {
+	if err := s.deleteZitiIdentity(ctx, identityID, zitiServiceID); err != nil {
 		log.Printf("WARN: best-effort cleanup of ziti identity %s failed: %v", identityID, err)
 	}
+}
+
+func (s *Server) deleteZitiIdentity(ctx context.Context, identityID uuid.UUID, zitiServiceID string) error {
+	_, err := s.zitiManagementClient.DeleteAppIdentity(ctx, &zitimanagementv1.DeleteAppIdentityRequest{
+		IdentityId:    identityID.String(),
+		ZitiServiceId: zitiServiceID,
+	})
+	return err
 }
 
 func identityFromMetadata(ctx context.Context) (uuid.UUID, error) {
