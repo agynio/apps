@@ -11,12 +11,13 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const (
 	appColumns          = `id, slug, name, description, icon, identity_id, service_token_hash, ziti_identity_id, ziti_service_id, organization_id, visibility, permissions, created_at, updated_at`
-	installationColumns = `id, app_id, organization_id, slug, configuration, created_at, updated_at`
+	installationColumns = `id, app_id, organization_id, slug, configuration, status, created_at, updated_at`
 
 	defaultListPageSize = 50
 	maxListPageSize     = 100
@@ -79,6 +80,7 @@ type Installation struct {
 	OrganizationID uuid.UUID
 	Slug           string
 	Configuration  map[string]any
+	Status         *string
 }
 
 type CreateInstallationInput struct {
@@ -138,16 +140,21 @@ func scanApp(row pgx.Row) (App, error) {
 
 func scanInstallation(row pgx.Row) (Installation, error) {
 	var installation Installation
+	var status pgtype.Text
 	if err := row.Scan(
 		&installation.Meta.ID,
 		&installation.AppID,
 		&installation.OrganizationID,
 		&installation.Slug,
 		&installation.Configuration,
+		&status,
 		&installation.Meta.CreatedAt,
 		&installation.Meta.UpdatedAt,
 	); err != nil {
 		return Installation{}, err
+	}
+	if status.Valid {
+		installation.Status = &status.String
 	}
 	return installation, nil
 }
@@ -537,6 +544,22 @@ func (s *Store) UpdateInstallation(ctx context.Context, input UpdateInstallation
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			return Installation{}, AlreadyExists("installation")
+		}
+		return Installation{}, err
+	}
+	return installation, nil
+}
+
+func (s *Store) UpdateInstallationStatus(ctx context.Context, id uuid.UUID, status *string) (Installation, error) {
+	row := s.pool.QueryRow(ctx,
+		fmt.Sprintf("UPDATE app_installations SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING %s", installationColumns),
+		status,
+		id,
+	)
+	installation, err := scanInstallation(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Installation{}, NotFound("installation")
 		}
 		return Installation{}, err
 	}

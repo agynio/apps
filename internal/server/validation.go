@@ -30,6 +30,13 @@ func validateName(name string) error {
 	return nil
 }
 
+func validateAuditLogMessage(message string) error {
+	if strings.TrimSpace(message) == "" {
+		return fmt.Errorf("message must be provided")
+	}
+	return nil
+}
+
 func validatePermissions(permissions []string) error {
 	seen := make(map[string]struct{}, len(permissions))
 	for _, permission := range permissions {
