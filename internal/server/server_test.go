@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -21,37 +22,127 @@ import (
 )
 
 type fakeStore struct {
-	createFn                 func(ctx context.Context, input storepkg.CreateAppInput) (storepkg.App, error)
-	updateFn                 func(ctx context.Context, input storepkg.UpdateAppInput) (storepkg.App, error)
-	getFn                    func(ctx context.Context, id uuid.UUID) (storepkg.App, error)
-	getBySlugFn              func(ctx context.Context, organizationID uuid.UUID, slug string) (storepkg.App, error)
-	getByIdentityFn          func(ctx context.Context, id uuid.UUID) (storepkg.App, error)
-	getByServiceTokenFn      func(ctx context.Context, tokenHash string) (storepkg.App, error)
-	listFn                   func(ctx context.Context, pageSize int, pageToken string, filter storepkg.ListAppsFilter) ([]storepkg.App, string, error)
-	deleteFn                 func(ctx context.Context, id uuid.UUID) error
-	hasActiveInstallationsFn func(ctx context.Context, appID uuid.UUID) (bool, error)
-	updateZitiIdentityFn     func(ctx context.Context, id uuid.UUID, zitiIdentityID string, zitiServiceID string) error
-	createInstallationFn     func(ctx context.Context, input storepkg.CreateInstallationInput) (storepkg.Installation, error)
-	getInstallationFn        func(ctx context.Context, id uuid.UUID) (storepkg.Installation, error)
-	getInstallationBySlugFn  func(ctx context.Context, organizationID uuid.UUID, slug string) (storepkg.Installation, error)
-	listInstallationsFn      func(ctx context.Context, pageSize int, pageToken string, filter storepkg.ListInstallationsFilter) ([]storepkg.Installation, string, error)
-	updateInstallationFn     func(ctx context.Context, input storepkg.UpdateInstallationInput) (storepkg.Installation, error)
-	deleteInstallationFn     func(ctx context.Context, id uuid.UUID) error
-	createInputs             []storepkg.CreateAppInput
-	updateInputs             []storepkg.UpdateAppInput
-	createInstallationInputs []storepkg.CreateInstallationInput
-	updateInstallationInputs []storepkg.UpdateInstallationInput
-	deleteInstallationCalls  []uuid.UUID
-	deleteCalls              []uuid.UUID
-	getCalls                 []uuid.UUID
-	getByServiceTokenCalls   []string
-	updateZitiCalls          []updateZitiCall
+	createFn                          func(ctx context.Context, input storepkg.CreateAppInput) (storepkg.App, error)
+	updateFn                          func(ctx context.Context, input storepkg.UpdateAppInput) (storepkg.App, error)
+	getFn                             func(ctx context.Context, id uuid.UUID) (storepkg.App, error)
+	getBySlugFn                       func(ctx context.Context, organizationID uuid.UUID, slug string) (storepkg.App, error)
+	getByIdentityFn                   func(ctx context.Context, id uuid.UUID) (storepkg.App, error)
+	getByServiceTokenFn               func(ctx context.Context, tokenHash string) (storepkg.App, error)
+	listFn                            func(ctx context.Context, pageSize int, pageToken string, filter storepkg.ListAppsFilter) ([]storepkg.App, string, error)
+	deleteFn                          func(ctx context.Context, id uuid.UUID) error
+	hasActiveInstallationsFn          func(ctx context.Context, appID uuid.UUID) (bool, error)
+	updateZitiIdentityFn              func(ctx context.Context, id uuid.UUID, zitiIdentityID string, zitiServiceID string) error
+	createInstallationFn              func(ctx context.Context, input storepkg.CreateInstallationInput) (storepkg.Installation, error)
+	getInstallationFn                 func(ctx context.Context, id uuid.UUID) (storepkg.Installation, error)
+	getInstallationBySlugFn           func(ctx context.Context, organizationID uuid.UUID, slug string) (storepkg.Installation, error)
+	listInstallationsFn               func(ctx context.Context, pageSize int, pageToken string, filter storepkg.ListInstallationsFilter) ([]storepkg.Installation, string, error)
+	updateInstallationFn              func(ctx context.Context, input storepkg.UpdateInstallationInput) (storepkg.Installation, error)
+	updateInstallationStatusFn        func(ctx context.Context, id uuid.UUID, status *string) (storepkg.Installation, error)
+	deleteInstallationFn              func(ctx context.Context, id uuid.UUID) error
+	appendInstallationAuditLogEntryFn func(ctx context.Context, input storepkg.AppendInstallationAuditLogEntryInput) (storepkg.InstallationAuditLogEntry, error)
+	listInstallationAuditLogEntriesFn func(ctx context.Context, installationID uuid.UUID, pageSize int, pageToken string) ([]storepkg.InstallationAuditLogEntry, string, error)
+	createInputs                      []storepkg.CreateAppInput
+	updateInputs                      []storepkg.UpdateAppInput
+	createInstallationInputs          []storepkg.CreateInstallationInput
+	updateInstallationInputs          []storepkg.UpdateInstallationInput
+	updateInstallationStatusCalls     []updateInstallationStatusCall
+	appendInstallationAuditLogInputs  []storepkg.AppendInstallationAuditLogEntryInput
+	listInstallationAuditLogCalls     []listAuditLogEntriesCall
+	deleteInstallationCalls           []uuid.UUID
+	deleteCalls                       []uuid.UUID
+	getCalls                          []uuid.UUID
+	getByServiceTokenCalls            []string
+	updateZitiCalls                   []updateZitiCall
 }
 
 type updateZitiCall struct {
 	id             uuid.UUID
 	zitiIdentityID string
 	zitiServiceID  string
+}
+
+type updateInstallationStatusCall struct {
+	id     uuid.UUID
+	status *string
+}
+
+type listAuditLogEntriesCall struct {
+	installationID uuid.UUID
+	pageSize       int
+	pageToken      string
+}
+
+type auditLogStore struct {
+	entries     []storepkg.InstallationAuditLogEntry
+	idempotency map[string]storepkg.InstallationAuditLogEntry
+	now         time.Time
+}
+
+func newAuditLogStore() *auditLogStore {
+	return &auditLogStore{
+		entries:     []storepkg.InstallationAuditLogEntry{},
+		idempotency: map[string]storepkg.InstallationAuditLogEntry{},
+		now:         time.Date(2026, 4, 20, 12, 0, 0, 0, time.UTC),
+	}
+}
+
+func (s *auditLogStore) append(input storepkg.AppendInstallationAuditLogEntryInput) storepkg.InstallationAuditLogEntry {
+	if input.IdempotencyKey != nil {
+		if existing, ok := s.idempotency[*input.IdempotencyKey]; ok {
+			return existing
+		}
+	}
+	entry := storepkg.InstallationAuditLogEntry{
+		ID:             uuid.New(),
+		InstallationID: input.InstallationID,
+		Message:        input.Message,
+		Level:          input.Level,
+		IdempotencyKey: input.IdempotencyKey,
+		CreatedAt:      s.now,
+	}
+	s.now = s.now.Add(time.Minute)
+	s.entries = append(s.entries, entry)
+	if input.IdempotencyKey != nil {
+		s.idempotency[*input.IdempotencyKey] = entry
+	}
+	if len(s.entries) > 1000 {
+		removed := s.entries[0]
+		s.entries = s.entries[1:]
+		if removed.IdempotencyKey != nil {
+			delete(s.idempotency, *removed.IdempotencyKey)
+		}
+	}
+	return entry
+}
+
+func (s *auditLogStore) list(pageSize int, pageToken string) ([]storepkg.InstallationAuditLogEntry, string, error) {
+	offset := 0
+	if pageToken != "" {
+		parsed, err := strconv.Atoi(pageToken)
+		if err != nil {
+			return nil, "", err
+		}
+		offset = parsed
+	}
+
+	ordered := make([]storepkg.InstallationAuditLogEntry, 0, len(s.entries))
+	for i := len(s.entries) - 1; i >= 0; i-- {
+		ordered = append(ordered, s.entries[i])
+	}
+
+	if offset >= len(ordered) {
+		return []storepkg.InstallationAuditLogEntry{}, "", nil
+	}
+	end := offset + pageSize
+	if end > len(ordered) {
+		end = len(ordered)
+	}
+	entries := ordered[offset:end]
+	nextToken := ""
+	if end < len(ordered) {
+		nextToken = strconv.Itoa(end)
+	}
+	return entries, nextToken, nil
 }
 
 func (f *fakeStore) CreateApp(ctx context.Context, input storepkg.CreateAppInput) (storepkg.App, error) {
@@ -169,6 +260,30 @@ func (f *fakeStore) UpdateInstallation(ctx context.Context, input storepkg.Updat
 		return f.updateInstallationFn(ctx, input)
 	}
 	return storepkg.Installation{}, errors.New("update installation not implemented")
+}
+
+func (f *fakeStore) UpdateInstallationStatus(ctx context.Context, id uuid.UUID, status *string) (storepkg.Installation, error) {
+	f.updateInstallationStatusCalls = append(f.updateInstallationStatusCalls, updateInstallationStatusCall{id: id, status: status})
+	if f.updateInstallationStatusFn != nil {
+		return f.updateInstallationStatusFn(ctx, id, status)
+	}
+	return storepkg.Installation{}, errors.New("update installation status not implemented")
+}
+
+func (f *fakeStore) AppendInstallationAuditLogEntry(ctx context.Context, input storepkg.AppendInstallationAuditLogEntryInput) (storepkg.InstallationAuditLogEntry, error) {
+	f.appendInstallationAuditLogInputs = append(f.appendInstallationAuditLogInputs, input)
+	if f.appendInstallationAuditLogEntryFn != nil {
+		return f.appendInstallationAuditLogEntryFn(ctx, input)
+	}
+	return storepkg.InstallationAuditLogEntry{}, errors.New("append installation audit log entry not implemented")
+}
+
+func (f *fakeStore) ListInstallationAuditLogEntries(ctx context.Context, installationID uuid.UUID, pageSize int, pageToken string) ([]storepkg.InstallationAuditLogEntry, string, error) {
+	f.listInstallationAuditLogCalls = append(f.listInstallationAuditLogCalls, listAuditLogEntriesCall{installationID: installationID, pageSize: pageSize, pageToken: pageToken})
+	if f.listInstallationAuditLogEntriesFn != nil {
+		return f.listInstallationAuditLogEntriesFn(ctx, installationID, pageSize, pageToken)
+	}
+	return nil, "", errors.New("list installation audit log entries not implemented")
 }
 
 func (f *fakeStore) DeleteInstallation(ctx context.Context, id uuid.UUID) error {
@@ -340,6 +455,10 @@ func newAdminContext() (context.Context, uuid.UUID) {
 	callerID := uuid.New()
 	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(identityMetadata, callerID.String()))
 	return ctx, callerID
+}
+
+func stringPtr(value string) *string {
+	return &value
 }
 
 func TestCreateAppSuccess(t *testing.T) {
@@ -1748,6 +1867,287 @@ func TestGetInstallationConfigurationRejectsNonAppIdentity(t *testing.T) {
 
 	srv := New(store, identityClient, authorizationClient, zitiClient)
 	_, err := srv.GetInstallationConfiguration(ctx, &appsv1.GetInstallationConfigurationRequest{Id: installationID.String()})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected permission denied, got %v", status.Code(err))
+	}
+}
+
+func TestReportInstallationStatusClearsWhitespace(t *testing.T) {
+	identityID := uuid.New()
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(identityMetadata, identityID.String()))
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	installationID := uuid.New()
+	appID := uuid.New()
+	organizationID := uuid.New()
+	store.getInstallationFn = func(_ context.Context, _ uuid.UUID) (storepkg.Installation, error) {
+		return storepkg.Installation{
+			Meta:           storepkg.EntityMeta{ID: installationID},
+			AppID:          appID,
+			OrganizationID: organizationID,
+		}, nil
+	}
+	store.getFn = func(_ context.Context, _ uuid.UUID) (storepkg.App, error) {
+		return storepkg.App{Meta: storepkg.EntityMeta{ID: appID}, IdentityID: identityID}, nil
+	}
+	store.updateInstallationStatusFn = func(_ context.Context, id uuid.UUID, status *string) (storepkg.Installation, error) {
+		if id != installationID {
+			return storepkg.Installation{}, fmt.Errorf("unexpected installation id")
+		}
+		if status != nil {
+			return storepkg.Installation{}, fmt.Errorf("expected status cleared")
+		}
+		return storepkg.Installation{
+			Meta:           storepkg.EntityMeta{ID: installationID},
+			AppID:          appID,
+			OrganizationID: organizationID,
+		}, nil
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	resp, err := srv.ReportInstallationStatus(ctx, &appsv1.ReportInstallationStatusRequest{
+		InstallationId: installationID.String(),
+		Status:         "   ",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.GetInstallation().GetStatus() != "" {
+		t.Fatalf("expected cleared status")
+	}
+}
+
+func TestReportInstallationStatusRejectsNonAppIdentity(t *testing.T) {
+	ctx, _ := newAdminContext()
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	installationID := uuid.New()
+	appID := uuid.New()
+	store.getInstallationFn = func(_ context.Context, _ uuid.UUID) (storepkg.Installation, error) {
+		return storepkg.Installation{Meta: storepkg.EntityMeta{ID: installationID}, AppID: appID}, nil
+	}
+	store.getFn = func(_ context.Context, _ uuid.UUID) (storepkg.App, error) {
+		return storepkg.App{Meta: storepkg.EntityMeta{ID: appID}, IdentityID: uuid.New()}, nil
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	_, err := srv.ReportInstallationStatus(ctx, &appsv1.ReportInstallationStatusRequest{
+		InstallationId: installationID.String(),
+		Status:         "ready",
+	})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected permission denied, got %v", status.Code(err))
+	}
+}
+
+func TestAppendInstallationAuditLogEntryRejectsNonAppIdentity(t *testing.T) {
+	ctx, _ := newAdminContext()
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	installationID := uuid.New()
+	appID := uuid.New()
+	store.getInstallationFn = func(_ context.Context, _ uuid.UUID) (storepkg.Installation, error) {
+		return storepkg.Installation{Meta: storepkg.EntityMeta{ID: installationID}, AppID: appID}, nil
+	}
+	store.getFn = func(_ context.Context, _ uuid.UUID) (storepkg.App, error) {
+		return storepkg.App{Meta: storepkg.EntityMeta{ID: appID}, IdentityID: uuid.New()}, nil
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	_, err := srv.AppendInstallationAuditLogEntry(ctx, &appsv1.AppendInstallationAuditLogEntryRequest{
+		InstallationId: installationID.String(),
+		Message:        "failed",
+		Level:          appsv1.InstallationAuditLogLevel_INSTALLATION_AUDIT_LOG_LEVEL_ERROR,
+	})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected permission denied, got %v", status.Code(err))
+	}
+}
+
+func TestAppendInstallationAuditLogEntryIdempotency(t *testing.T) {
+	identityID := uuid.New()
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(identityMetadata, identityID.String()))
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	installationID := uuid.New()
+	appID := uuid.New()
+	auditLog := newAuditLogStore()
+	store.getInstallationFn = func(_ context.Context, _ uuid.UUID) (storepkg.Installation, error) {
+		return storepkg.Installation{Meta: storepkg.EntityMeta{ID: installationID}, AppID: appID}, nil
+	}
+	store.getFn = func(_ context.Context, _ uuid.UUID) (storepkg.App, error) {
+		return storepkg.App{Meta: storepkg.EntityMeta{ID: appID}, IdentityID: identityID}, nil
+	}
+	store.appendInstallationAuditLogEntryFn = func(_ context.Context, input storepkg.AppendInstallationAuditLogEntryInput) (storepkg.InstallationAuditLogEntry, error) {
+		return auditLog.append(input), nil
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	first, err := srv.AppendInstallationAuditLogEntry(ctx, &appsv1.AppendInstallationAuditLogEntryRequest{
+		InstallationId: installationID.String(),
+		Message:        "attempt",
+		Level:          appsv1.InstallationAuditLogLevel_INSTALLATION_AUDIT_LOG_LEVEL_INFO,
+		IdempotencyKey: stringPtr("same-key"),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	second, err := srv.AppendInstallationAuditLogEntry(ctx, &appsv1.AppendInstallationAuditLogEntryRequest{
+		InstallationId: installationID.String(),
+		Message:        "attempt",
+		Level:          appsv1.InstallationAuditLogLevel_INSTALLATION_AUDIT_LOG_LEVEL_INFO,
+		IdempotencyKey: stringPtr("same-key"),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if first.GetEntry().GetId() != second.GetEntry().GetId() {
+		t.Fatalf("expected idempotent entry")
+	}
+	if len(auditLog.entries) != 1 {
+		t.Fatalf("expected one entry, got %d", len(auditLog.entries))
+	}
+}
+
+func TestAppendInstallationAuditLogEntryRetention(t *testing.T) {
+	identityID := uuid.New()
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(identityMetadata, identityID.String()))
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	installationID := uuid.New()
+	appID := uuid.New()
+	auditLog := newAuditLogStore()
+	store.getInstallationFn = func(_ context.Context, _ uuid.UUID) (storepkg.Installation, error) {
+		return storepkg.Installation{Meta: storepkg.EntityMeta{ID: installationID}, AppID: appID}, nil
+	}
+	store.getFn = func(_ context.Context, _ uuid.UUID) (storepkg.App, error) {
+		return storepkg.App{Meta: storepkg.EntityMeta{ID: appID}, IdentityID: identityID}, nil
+	}
+	store.appendInstallationAuditLogEntryFn = func(_ context.Context, input storepkg.AppendInstallationAuditLogEntryInput) (storepkg.InstallationAuditLogEntry, error) {
+		return auditLog.append(input), nil
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	for i := 0; i < 1001; i++ {
+		_, err := srv.AppendInstallationAuditLogEntry(ctx, &appsv1.AppendInstallationAuditLogEntryRequest{
+			InstallationId: installationID.String(),
+			Message:        fmt.Sprintf("entry-%d", i),
+			Level:          appsv1.InstallationAuditLogLevel_INSTALLATION_AUDIT_LOG_LEVEL_INFO,
+			IdempotencyKey: stringPtr(fmt.Sprintf("key-%d", i)),
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	if len(auditLog.entries) != 1000 {
+		t.Fatalf("expected 1000 retained entries, got %d", len(auditLog.entries))
+	}
+	if auditLog.entries[0].Message != "entry-1" {
+		t.Fatalf("expected oldest entry to be trimmed")
+	}
+}
+
+func TestListInstallationAuditLogEntriesPagination(t *testing.T) {
+	ctx, _ := newAdminContext()
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	installationID := uuid.New()
+	appID := uuid.New()
+	organizationID := uuid.New()
+	auditLog := newAuditLogStore()
+	store.getInstallationFn = func(_ context.Context, _ uuid.UUID) (storepkg.Installation, error) {
+		return storepkg.Installation{Meta: storepkg.EntityMeta{ID: installationID}, AppID: appID, OrganizationID: organizationID}, nil
+	}
+	store.listInstallationAuditLogEntriesFn = func(_ context.Context, _ uuid.UUID, pageSize int, pageToken string) ([]storepkg.InstallationAuditLogEntry, string, error) {
+		return auditLog.list(pageSize, pageToken)
+	}
+
+	for i := 0; i < 4; i++ {
+		auditLog.append(storepkg.AppendInstallationAuditLogEntryInput{
+			InstallationID: installationID,
+			Message:        fmt.Sprintf("entry-%d", i),
+			Level:          storepkg.InstallationAuditLogLevelInfo,
+		})
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	first, err := srv.ListInstallationAuditLogEntries(ctx, &appsv1.ListInstallationAuditLogEntriesRequest{
+		InstallationId: installationID.String(),
+		PageSize:       2,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(first.GetEntries()) != 2 {
+		t.Fatalf("expected first page entries")
+	}
+	if first.GetEntries()[0].GetMessage() != "entry-3" || first.GetEntries()[1].GetMessage() != "entry-2" {
+		t.Fatalf("unexpected page order")
+	}
+	if first.GetNextPageToken() == "" {
+		t.Fatalf("expected next page token")
+	}
+
+	second, err := srv.ListInstallationAuditLogEntries(ctx, &appsv1.ListInstallationAuditLogEntriesRequest{
+		InstallationId: installationID.String(),
+		PageSize:       2,
+		PageToken:      first.GetNextPageToken(),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(second.GetEntries()) != 2 {
+		t.Fatalf("expected second page entries")
+	}
+	if second.GetEntries()[0].GetMessage() != "entry-1" || second.GetEntries()[1].GetMessage() != "entry-0" {
+		t.Fatalf("unexpected second page order")
+	}
+	if second.GetNextPageToken() != "" {
+		t.Fatalf("expected no further page token")
+	}
+}
+
+func TestListInstallationAuditLogEntriesRejectsNonMember(t *testing.T) {
+	ctx, callerID := newAdminContext()
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	installationID := uuid.New()
+	organizationID := uuid.New()
+	store.getInstallationFn = func(_ context.Context, _ uuid.UUID) (storepkg.Installation, error) {
+		return storepkg.Installation{Meta: storepkg.EntityMeta{ID: installationID}, OrganizationID: organizationID}, nil
+	}
+	authorizationClient.checkFn = func(_ context.Context, req *authorizationv1.CheckRequest) (*authorizationv1.CheckResponse, error) {
+		if req.GetTupleKey().GetUser() != fmt.Sprintf("identity:%s", callerID.String()) {
+			return nil, errors.New("unexpected identity")
+		}
+		return &authorizationv1.CheckResponse{Allowed: false}, nil
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	_, err := srv.ListInstallationAuditLogEntries(ctx, &appsv1.ListInstallationAuditLogEntriesRequest{
+		InstallationId: installationID.String(),
+	})
 	if status.Code(err) != codes.PermissionDenied {
 		t.Fatalf("expected permission denied, got %v", status.Code(err))
 	}

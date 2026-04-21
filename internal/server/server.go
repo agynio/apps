@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 
 	appsv1 "github.com/agynio/apps/.gen/go/agynio/api/apps/v1"
 	authorizationv1 "github.com/agynio/apps/.gen/go/agynio/api/authorization/v1"
@@ -46,7 +47,10 @@ type AppStore interface {
 	GetInstallationBySlug(ctx context.Context, organizationID uuid.UUID, slug string) (store.Installation, error)
 	ListInstallations(ctx context.Context, pageSize int, pageToken string, filter store.ListInstallationsFilter) ([]store.Installation, string, error)
 	UpdateInstallation(ctx context.Context, input store.UpdateInstallationInput) (store.Installation, error)
+	UpdateInstallationStatus(ctx context.Context, id uuid.UUID, status *string) (store.Installation, error)
 	DeleteInstallation(ctx context.Context, id uuid.UUID) error
+	AppendInstallationAuditLogEntry(ctx context.Context, input store.AppendInstallationAuditLogEntryInput) (store.InstallationAuditLogEntry, error)
+	ListInstallationAuditLogEntries(ctx context.Context, installationID uuid.UUID, pageSize int, pageToken string) ([]store.InstallationAuditLogEntry, string, error)
 }
 
 type Server struct {
@@ -627,22 +631,132 @@ func (s *Server) GetInstallationConfiguration(ctx context.Context, req *appsv1.G
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "id: %v", err)
 	}
-	installation, err := s.store.GetInstallation(ctx, id)
+	installation, err := s.requireInstallationForAppIdentity(ctx, callerID, id)
 	if err != nil {
-		return nil, toStatusError(err)
-	}
-	app, err := s.store.GetApp(ctx, installation.AppID)
-	if err != nil {
-		return nil, toStatusError(err)
-	}
-	if app.IdentityID != callerID {
-		return nil, status.Error(codes.PermissionDenied, "permission denied")
+		return nil, err
 	}
 	configuration, err := mapToProtoStruct(installation.Configuration)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "convert configuration: %v", err)
 	}
 	return &appsv1.GetInstallationConfigurationResponse{Configuration: configuration}, nil
+}
+
+func (s *Server) ReportInstallationStatus(ctx context.Context, req *appsv1.ReportInstallationStatusRequest) (*appsv1.ReportInstallationStatusResponse, error) {
+	callerID, err := identityFromMetadata(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Unauthenticated, "unauthenticated: %v", err)
+	}
+	installationID, err := parseUUID(req.GetInstallationId())
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "installation_id: %v", err)
+	}
+	installation, err := s.requireInstallationForAppIdentity(ctx, callerID, installationID)
+	if err != nil {
+		return nil, err
+	}
+
+	statusValue := req.GetStatus()
+	var normalizedStatus *string
+	if strings.TrimSpace(statusValue) != "" {
+		normalizedStatus = &statusValue
+	}
+
+	installation, err = s.store.UpdateInstallationStatus(ctx, installation.Meta.ID, normalizedStatus)
+	if err != nil {
+		return nil, toStatusError(err)
+	}
+	protoInstallation, err := toProtoInstallation(installation)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "convert installation: %v", err)
+	}
+	return &appsv1.ReportInstallationStatusResponse{Installation: protoInstallation}, nil
+}
+
+func (s *Server) AppendInstallationAuditLogEntry(ctx context.Context, req *appsv1.AppendInstallationAuditLogEntryRequest) (*appsv1.AppendInstallationAuditLogEntryResponse, error) {
+	callerID, err := identityFromMetadata(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Unauthenticated, "unauthenticated: %v", err)
+	}
+	installationID, err := parseUUID(req.GetInstallationId())
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "installation_id: %v", err)
+	}
+	if _, err := s.requireInstallationForAppIdentity(ctx, callerID, installationID); err != nil {
+		return nil, err
+	}
+
+	message := req.GetMessage()
+	if err := validateAuditLogMessage(message); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "message: %v", err)
+	}
+	level, err := toStoreAuditLogLevel(req.GetLevel())
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "level: %v", err)
+	}
+	var idempotencyKey *string
+	if trimmedKey := strings.TrimSpace(req.GetIdempotencyKey()); trimmedKey != "" {
+		idempotencyKey = &trimmedKey
+	}
+
+	entry, err := s.store.AppendInstallationAuditLogEntry(ctx, store.AppendInstallationAuditLogEntryInput{
+		InstallationID: installationID,
+		Message:        message,
+		Level:          level,
+		IdempotencyKey: idempotencyKey,
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "append audit log entry: %v", err)
+	}
+	protoEntry := toProtoInstallationAuditLogEntry(entry)
+	return &appsv1.AppendInstallationAuditLogEntryResponse{Entry: protoEntry}, nil
+}
+
+func (s *Server) ListInstallationAuditLogEntries(ctx context.Context, req *appsv1.ListInstallationAuditLogEntriesRequest) (*appsv1.ListInstallationAuditLogEntriesResponse, error) {
+	callerID, err := identityFromMetadata(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Unauthenticated, "unauthenticated: %v", err)
+	}
+	installationID, err := parseUUID(req.GetInstallationId())
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "installation_id: %v", err)
+	}
+	installation, err := s.store.GetInstallation(ctx, installationID)
+	if err != nil {
+		return nil, toStatusError(err)
+	}
+	if err := s.requireOrgMember(ctx, callerID, installation.OrganizationID); err != nil {
+		return nil, err
+	}
+
+	entries, nextToken, err := s.store.ListInstallationAuditLogEntries(ctx, installationID, int(req.GetPageSize()), req.GetPageToken())
+	if err != nil {
+		var invalidToken *store.InvalidPageTokenError
+		if errors.As(err, &invalidToken) {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid page_token: %v", invalidToken.Err)
+		}
+		return nil, status.Errorf(codes.Internal, "list audit log entries: %v", err)
+	}
+	protoEntries := make([]*appsv1.InstallationAuditLogEntry, 0, len(entries))
+	for _, entry := range entries {
+		protoEntries = append(protoEntries, toProtoInstallationAuditLogEntry(entry))
+	}
+	return &appsv1.ListInstallationAuditLogEntriesResponse{Entries: protoEntries, NextPageToken: nextToken}, nil
+}
+
+func (s *Server) requireInstallationForAppIdentity(ctx context.Context, identityID uuid.UUID, installationID uuid.UUID) (store.Installation, error) {
+	installation, err := s.store.GetInstallation(ctx, installationID)
+	if err != nil {
+		return store.Installation{}, toStatusError(err)
+	}
+	app, err := s.store.GetApp(ctx, installation.AppID)
+	if err != nil {
+		return store.Installation{}, toStatusError(err)
+	}
+	if app.IdentityID != identityID {
+		return store.Installation{}, status.Error(codes.PermissionDenied, "permission denied")
+	}
+	return installation, nil
 }
 
 func (s *Server) requireOrgOwner(ctx context.Context, identityID uuid.UUID, organizationID uuid.UUID) error {

@@ -38,13 +38,18 @@ func toProtoInstallation(installation store.Installation) (*appsv1.Installation,
 	if err != nil {
 		return nil, err
 	}
-	return &appsv1.Installation{
+	protoInstallation := &appsv1.Installation{
 		Meta:           toProtoEntityMeta(installation.Meta),
 		AppId:          installation.AppID.String(),
 		OrganizationId: installation.OrganizationID.String(),
 		Slug:           installation.Slug,
 		Configuration:  configuration,
-	}, nil
+	}
+	if installation.Status != nil {
+		status := *installation.Status
+		protoInstallation.Status = &status
+	}
+	return protoInstallation, nil
 }
 
 func toProtoVisibility(visibility store.AppVisibility) appsv1.AppVisibility {
@@ -66,6 +71,32 @@ func toStoreVisibility(visibility appsv1.AppVisibility) (store.AppVisibility, er
 		return store.AppVisibilityInternal, nil
 	default:
 		return "", fmt.Errorf("unknown visibility %v", visibility)
+	}
+}
+
+func toProtoAuditLogLevel(level store.InstallationAuditLogLevel) appsv1.InstallationAuditLogLevel {
+	switch level {
+	case store.InstallationAuditLogLevelInfo:
+		return appsv1.InstallationAuditLogLevel_INSTALLATION_AUDIT_LOG_LEVEL_INFO
+	case store.InstallationAuditLogLevelWarning:
+		return appsv1.InstallationAuditLogLevel_INSTALLATION_AUDIT_LOG_LEVEL_WARNING
+	case store.InstallationAuditLogLevelError:
+		return appsv1.InstallationAuditLogLevel_INSTALLATION_AUDIT_LOG_LEVEL_ERROR
+	default:
+		panic("unknown audit log level")
+	}
+}
+
+func toStoreAuditLogLevel(level appsv1.InstallationAuditLogLevel) (store.InstallationAuditLogLevel, error) {
+	switch level {
+	case appsv1.InstallationAuditLogLevel_INSTALLATION_AUDIT_LOG_LEVEL_INFO:
+		return store.InstallationAuditLogLevelInfo, nil
+	case appsv1.InstallationAuditLogLevel_INSTALLATION_AUDIT_LOG_LEVEL_WARNING:
+		return store.InstallationAuditLogLevelWarning, nil
+	case appsv1.InstallationAuditLogLevel_INSTALLATION_AUDIT_LOG_LEVEL_ERROR:
+		return store.InstallationAuditLogLevelError, nil
+	default:
+		return "", fmt.Errorf("unknown audit log level %v", level)
 	}
 }
 
@@ -95,4 +126,19 @@ func toProtoAppProfile(app store.App) *appsv1.AppProfile {
 		Description: app.Description,
 		Icon:        app.Icon,
 	}
+}
+
+func toProtoInstallationAuditLogEntry(entry store.InstallationAuditLogEntry) *appsv1.InstallationAuditLogEntry {
+	protoEntry := &appsv1.InstallationAuditLogEntry{
+		Id:             entry.ID.String(),
+		InstallationId: entry.InstallationID.String(),
+		Message:        entry.Message,
+		Level:          toProtoAuditLogLevel(entry.Level),
+		CreatedAt:      timestamppb.New(entry.CreatedAt),
+	}
+	if entry.IdempotencyKey != nil {
+		idempotencyKey := *entry.IdempotencyKey
+		protoEntry.IdempotencyKey = &idempotencyKey
+	}
+	return protoEntry
 }

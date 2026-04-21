@@ -119,3 +119,39 @@ func TestValidateName(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateAuditLogMessage(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{
+			name:    "valid",
+			value:   "Installation started",
+			wantErr: false,
+		},
+		{
+			name:    "empty",
+			value:   "",
+			wantErr: true,
+		},
+		{
+			name:    "whitespace",
+			value:   "  ",
+			wantErr: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateAuditLogMessage(test.value)
+			if test.wantErr && err == nil {
+				t.Fatalf("expected error")
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
