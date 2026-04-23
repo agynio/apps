@@ -502,22 +502,37 @@ func (s *Server) ListInstallations(ctx context.Context, req *appsv1.ListInstalla
 		return nil, status.Errorf(codes.Unauthenticated, "unauthenticated: %v", err)
 	}
 	filter := store.ListInstallationsFilter{}
-	if req.GetOrganizationId() != "" {
-		organizationID, err := parseUUID(req.GetOrganizationId())
-		if err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "organization_id: %v", err)
-		}
-		if err := s.requireOrgMember(ctx, callerID, organizationID); err != nil {
-			return nil, err
-		}
-		filter.OrganizationID = &organizationID
-	}
+	allowAppIdentity := false
 	if req.GetAppId() != "" {
 		appID, err := parseUUID(req.GetAppId())
 		if err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "app_id: %v", err)
 		}
 		filter.AppID = &appID
+		app, err := s.store.GetAppByIdentityID(ctx, callerID)
+		if err != nil {
+			var notFound *store.NotFoundError
+			if !errors.As(err, &notFound) {
+				return nil, toStatusError(err)
+			}
+		} else {
+			if app.Meta.ID != appID {
+				return nil, status.Error(codes.PermissionDenied, "permission denied")
+			}
+			allowAppIdentity = true
+		}
+	}
+	if req.GetOrganizationId() != "" {
+		organizationID, err := parseUUID(req.GetOrganizationId())
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "organization_id: %v", err)
+		}
+		if !allowAppIdentity {
+			if err := s.requireOrgMember(ctx, callerID, organizationID); err != nil {
+				return nil, err
+			}
+		}
+		filter.OrganizationID = &organizationID
 	}
 
 	installations, nextToken, err := s.store.ListInstallations(ctx, int(req.GetPageSize()), req.GetPageToken(), filter)
@@ -531,7 +546,7 @@ func (s *Server) ListInstallations(ctx context.Context, req *appsv1.ListInstalla
 	protoInstallations := make([]*appsv1.Installation, 0, len(installations))
 	orgAccess := map[uuid.UUID]bool{}
 	for _, installation := range installations {
-		if filter.OrganizationID == nil {
+		if filter.OrganizationID == nil && !allowAppIdentity {
 			allowed, ok := orgAccess[installation.OrganizationID]
 			if !ok {
 				var err error
