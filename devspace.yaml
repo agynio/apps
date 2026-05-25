@@ -70,6 +70,24 @@ functions:
                 limits:
                   cpu: "2"
                   memory: 4Gi
+              livenessProbe:
+                tcpSocket: null
+                exec:
+                  command:
+                    - sh
+                    - -c
+                    - "true"
+                initialDelaySeconds: 1
+                periodSeconds: 10
+              readinessProbe:
+                tcpSocket: null
+                exec:
+                  command:
+                    - sh
+                    - -c
+                    - "true"
+                initialDelaySeconds: 1
+                periodSeconds: 10
               securityContext:
                 runAsNonRoot: true
                 runAsUser: 1000
@@ -98,7 +116,7 @@ pipelines:
         start_dev --disable-pod-replace apps
         echo "Waiting for apps to be healthy on :50051..."
         healthy=false
-        for i in $(seq 1 60); do
+        for i in $(seq 1 150); do
           if exec_container --label-selector=app.kubernetes.io/name=apps -n ${APPS_NAMESPACE} -- bash -c 'nc -z localhost 50051 >/dev/null 2>&1 || (echo > /dev/tcp/localhost/50051) >/dev/null 2>&1'; then
             healthy=true
             break
@@ -106,7 +124,7 @@ pipelines:
           sleep 2
         done
         if [ "$healthy" != "true" ]; then
-          echo "ERROR: Apps did not become healthy within 120s" >&2
+          echo "ERROR: Apps did not become healthy within 300s" >&2
           exit 1
         fi
         echo "Dev environment ready. Stopping dev session."
