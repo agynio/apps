@@ -41,6 +41,9 @@ functions:
             - name: apps
               image: ghcr.io/agynio/devcontainer-go:1 # dev container for source deploy
               workingDir: /opt/app/data
+              env:
+                - name: PATH
+                  value: /go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
               command:
                 - sh
                 - -c
