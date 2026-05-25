@@ -48,18 +48,7 @@ functions:
                 - sh
                 - -c
                 - |
-                  set -eu
-                  elapsed=0
-                  while [ ! -f /opt/app/data/go.mod ]; do
-                    sleep 1; elapsed=$((elapsed + 1))
-                    [ "$elapsed" -ge 120 ] && { echo "ERROR: sync timeout" >&2; exit 1; }
-                  done
-                  buf generate buf.build/agynio/api \
-                    --path agynio/api/apps/v1 \
-                    --path agynio/api/authorization/v1 \
-                    --path agynio/api/identity/v1 \
-                    --path agynio/api/ziti_management/v1
-                  exec go run ./cmd/apps-service
+                  sleep infinity
               volumeMounts:
                 - name: data
                   mountPath: /opt/app/data
@@ -114,6 +103,16 @@ pipelines:
         start_dev --disable-pod-replace apps
       else
         start_dev --disable-pod-replace apps
+        echo "Starting apps service from synced source..."
+        exec_container --label-selector=app.kubernetes.io/name=apps -n ${APPS_NAMESPACE} -- bash -lc 'set -euo pipefail
+          cd /opt/app/data
+          buf generate buf.build/agynio/api \
+            --path agynio/api/apps/v1 \
+            --path agynio/api/authorization/v1 \
+            --path agynio/api/identity/v1 \
+            --path agynio/api/ziti_management/v1
+          nohup go run ./cmd/apps-service >/tmp/apps-service.log 2>&1 &
+        '
         echo "Waiting for apps to be healthy on :50051..."
         healthy=false
         for i in $(seq 1 150); do
@@ -124,6 +123,7 @@ pipelines:
           sleep 2
         done
         if [ "$healthy" != "true" ]; then
+          exec_container --label-selector=app.kubernetes.io/name=apps -n ${APPS_NAMESPACE} -- bash -lc 'cat /tmp/apps-service.log >&2' || true
           echo "ERROR: Apps did not become healthy within 300s" >&2
           exit 1
         fi
