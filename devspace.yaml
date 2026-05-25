@@ -26,7 +26,7 @@ functions:
     fi
   patch_deployment: |-
     echo "Patching apps deployment for DevSpace..."
-    kubectl patch deployment apps-apps -n ${APPS_NAMESPACE} --type strategic --patch "$(cat <<'EOF'
+    kubectl patch deployment apps -n ${APPS_NAMESPACE} --type strategic --patch "$(cat <<'EOF'
     spec:
       template:
         spec:
