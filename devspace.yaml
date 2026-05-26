@@ -26,7 +26,7 @@ functions:
     fi
   patch_deployment: |-
     echo "Patching apps deployment for DevSpace..."
-    kubectl patch deployment apps-apps -n ${APPS_NAMESPACE} --type strategic --patch "$(cat <<'EOF'
+    kubectl patch deployment apps -n ${APPS_NAMESPACE} --type strategic --patch "$(cat <<'EOF'
     spec:
       template:
         spec:
@@ -41,22 +41,14 @@ functions:
             - name: apps
               image: ghcr.io/agynio/devcontainer-go:1 # dev container for source deploy
               workingDir: /opt/app/data
+              env:
+                - name: PATH
+                  value: /go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
               command:
                 - sh
                 - -c
                 - |
-                  set -eu
-                  elapsed=0
-                  while [ ! -f /opt/app/data/go.mod ]; do
-                    sleep 1; elapsed=$((elapsed + 1))
-                    [ "$elapsed" -ge 120 ] && { echo "ERROR: sync timeout" >&2; exit 1; }
-                  done
-                  buf generate buf.build/agynio/api \
-                    --path agynio/api/apps/v1 \
-                    --path agynio/api/authorization/v1 \
-                    --path agynio/api/identity/v1 \
-                    --path agynio/api/ziti_management/v1
-                  exec go run ./cmd/apps-service
+                  sleep infinity
               volumeMounts:
                 - name: data
                   mountPath: /opt/app/data
@@ -67,6 +59,24 @@ functions:
                 limits:
                   cpu: "2"
                   memory: 4Gi
+              livenessProbe:
+                tcpSocket: null
+                exec:
+                  command:
+                    - sh
+                    - -c
+                    - "true"
+                initialDelaySeconds: 1
+                periodSeconds: 10
+              readinessProbe:
+                tcpSocket: null
+                exec:
+                  command:
+                    - sh
+                    - -c
+                    - "true"
+                initialDelaySeconds: 1
+                periodSeconds: 10
               securityContext:
                 runAsNonRoot: true
                 runAsUser: 1000
@@ -93,9 +103,35 @@ pipelines:
         start_dev --disable-pod-replace apps
       else
         start_dev --disable-pod-replace apps
+        echo "Starting apps service from synced source..."
+        exec_container --label-selector=app.kubernetes.io/name=apps -n ${APPS_NAMESPACE} -- bash -lc 'set -euo pipefail
+          echo "PATH=${PATH}"
+          if [ -x /usr/local/go/bin/go ]; then
+            GO_BIN=/usr/local/go/bin/go
+          elif [ -x /root/.nix-profile/bin/go ]; then
+            GO_BIN=/root/.nix-profile/bin/go
+          elif [ -x /home/godev/.nix-profile/bin/go ]; then
+            GO_BIN=/home/godev/.nix-profile/bin/go
+          elif command -v go >/dev/null 2>&1; then
+            GO_BIN=$(command -v go)
+          else
+            echo "ERROR: go binary not found" >&2
+            find /usr/local /root /home /go -path "*/bin/go" -type f 2>/dev/null >&2 || true
+            exit 1
+          fi
+          echo "Using go: ${GO_BIN}"
+          "${GO_BIN}" version
+          cd /opt/app/data
+          buf generate buf.build/agynio/api \
+            --path agynio/api/apps/v1 \
+            --path agynio/api/authorization/v1 \
+            --path agynio/api/identity/v1 \
+            --path agynio/api/ziti_management/v1
+          nohup "${GO_BIN}" run ./cmd/apps-service >/tmp/apps-service.log 2>&1 &
+        '
         echo "Waiting for apps to be healthy on :50051..."
         healthy=false
-        for i in $(seq 1 60); do
+        for i in $(seq 1 150); do
           if exec_container --label-selector=app.kubernetes.io/name=apps -n ${APPS_NAMESPACE} -- bash -c 'nc -z localhost 50051 >/dev/null 2>&1 || (echo > /dev/tcp/localhost/50051) >/dev/null 2>&1'; then
             healthy=true
             break
@@ -103,7 +139,8 @@ pipelines:
           sleep 2
         done
         if [ "$healthy" != "true" ]; then
-          echo "ERROR: Apps did not become healthy within 120s" >&2
+          exec_container --label-selector=app.kubernetes.io/name=apps -n ${APPS_NAMESPACE} -- bash -lc 'cat /tmp/apps-service.log >&2' || true
+          echo "ERROR: Apps did not become healthy within 300s" >&2
           exit 1
         fi
         echo "Dev environment ready. Stopping dev session."
