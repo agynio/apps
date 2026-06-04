@@ -1,5 +1,5 @@
 nameOverride: ""
-fullnameOverride: ""
+fullnameOverride: "apps"
 
 global:
   imageRegistry: ""
@@ -73,7 +73,10 @@ env:
   - name: GRPC_ADDRESS
     value: ":50051"
   - name: DATABASE_URL
-    value: ""
+    valueFrom:
+      secretKeyRef:
+        name: agyn-platform-database-urls
+        key: apps
   - name: IDENTITY_GRPC_TARGET
     value: "identity:50051"
   - name: AUTHORIZATION_GRPC_TARGET
