@@ -12,10 +12,12 @@ import (
 
 	appsv1 "github.com/agynio/apps/.gen/go/agynio/api/apps/v1"
 	authorizationv1 "github.com/agynio/apps/.gen/go/agynio/api/authorization/v1"
+	groupsv1 "github.com/agynio/apps/.gen/go/agynio/api/groups/v1"
 	identityv1 "github.com/agynio/apps/.gen/go/agynio/api/identity/v1"
 	zitimanagementv1 "github.com/agynio/apps/.gen/go/agynio/api/ziti_management/v1"
 	"github.com/agynio/apps/internal/store"
 	"github.com/google/uuid"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -58,20 +60,43 @@ type Server struct {
 	store                AppStore
 	identityClient       identityv1.IdentityServiceClient
 	authorizationClient  authorizationv1.AuthorizationServiceClient
-	zitiManagementClient zitimanagementv1.ZitiManagementServiceClient
+	zitiManagementClient zitiManagementClient
+	groupsClient         groupsClient
+}
+
+type zitiManagementClient interface {
+	CreateAppIdentity(context.Context, *zitimanagementv1.CreateAppIdentityRequest, ...grpc.CallOption) (*zitimanagementv1.CreateAppIdentityResponse, error)
+	CreateService(context.Context, *zitimanagementv1.CreateServiceRequest, ...grpc.CallOption) (*zitimanagementv1.CreateServiceResponse, error)
+	DeleteAppIdentity(context.Context, *zitimanagementv1.DeleteAppIdentityRequest, ...grpc.CallOption) (*zitimanagementv1.DeleteAppIdentityResponse, error)
+	PatchIdentityRoleAttributes(context.Context, *zitimanagementv1.PatchIdentityRoleAttributesRequest, ...grpc.CallOption) (*zitimanagementv1.PatchIdentityRoleAttributesResponse, error)
+}
+
+type groupsClient interface {
+	ListMemberGroups(context.Context, *groupsv1.ListMemberGroupsRequest, ...grpc.CallOption) (*groupsv1.ListMemberGroupsResponse, error)
 }
 
 func New(
 	store AppStore,
 	identityClient identityv1.IdentityServiceClient,
 	authorizationClient authorizationv1.AuthorizationServiceClient,
-	zitiManagementClient zitimanagementv1.ZitiManagementServiceClient,
+	zitiManagementClient zitiManagementClient,
+) *Server {
+	return NewWithGroups(store, identityClient, authorizationClient, zitiManagementClient, nil)
+}
+
+func NewWithGroups(
+	store AppStore,
+	identityClient identityv1.IdentityServiceClient,
+	authorizationClient authorizationv1.AuthorizationServiceClient,
+	zitiManagementClient zitiManagementClient,
+	groupsClient groupsClient,
 ) *Server {
 	return &Server{
 		store:                store,
 		identityClient:       identityClient,
 		authorizationClient:  authorizationClient,
 		zitiManagementClient: zitiManagementClient,
+		groupsClient:         groupsClient,
 	}
 }
 
@@ -369,9 +394,15 @@ func (s *Server) EnrollApp(ctx context.Context, req *appsv1.EnrollAppRequest) (*
 		return nil, toStatusError(err)
 	}
 
+	groupRoleAttributes, err := s.appGroupRoleAttributes(ctx, app)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list app group memberships: %v", err)
+	}
+
 	zitiResp, err := s.zitiManagementClient.CreateAppIdentity(ctx, &zitimanagementv1.CreateAppIdentityRequest{
-		IdentityId: app.IdentityID.String(),
-		Slug:       app.Slug,
+		IdentityId:               app.IdentityID.String(),
+		Slug:                     app.Slug,
+		AdditionalRoleAttributes: groupRoleAttributes,
 	})
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "create ziti identity: %v", err)

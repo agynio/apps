@@ -12,6 +12,7 @@ import (
 
 	appsv1 "github.com/agynio/apps/.gen/go/agynio/api/apps/v1"
 	authorizationv1 "github.com/agynio/apps/.gen/go/agynio/api/authorization/v1"
+	groupsv1 "github.com/agynio/apps/.gen/go/agynio/api/groups/v1"
 	identityv1 "github.com/agynio/apps/.gen/go/agynio/api/identity/v1"
 	zitimanagementv1 "github.com/agynio/apps/.gen/go/agynio/api/ziti_management/v1"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -71,14 +72,24 @@ func run() error {
 	}
 	defer zitiConn.Close()
 
+	groupsConn, err := grpc.NewClient(cfg.GroupsGRPCTarget, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return fmt.Errorf("connect to groups: %w", err)
+	}
+	defer groupsConn.Close()
+
 	grpcServer := grpc.NewServer()
-	serverInstance := server.New(
+	serverInstance := server.NewWithGroups(
 		store.New(pool),
 		identityv1.NewIdentityServiceClient(identityConn),
 		authorizationv1.NewAuthorizationServiceClient(authConn),
 		zitimanagementv1.NewZitiManagementServiceClient(zitiConn),
+		groupsv1.NewGroupsServiceClient(groupsConn),
 	)
 	appsv1.RegisterAppsServiceServer(grpcServer, serverInstance)
+
+	serverInstance.StartGroupMembershipConsumerLoop(ctx, cfg.NATSURL, cfg.GroupSyncDurable)
+	serverInstance.StartGroupRoleReconciliation(ctx, cfg.ReconciliationInterval)
 
 	lis, err := net.Listen("tcp", cfg.GRPCAddress)
 	if err != nil {

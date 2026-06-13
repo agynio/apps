@@ -13,7 +13,7 @@ func TestNormalizePageSize(t *testing.T) {
 	if normalizePageSize(-5) != defaultListPageSize {
 		t.Fatalf("expected default page size for negative")
 	}
-	if normalizePageSize(maxListPageSize+10) != maxListPageSize {
+	if normalizePageSize(MaxListPageSize+10) != MaxListPageSize {
 		t.Fatalf("expected max page size clamp")
 	}
 	if normalizePageSize(25) != 25 {
