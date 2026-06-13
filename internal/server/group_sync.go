@@ -89,7 +89,7 @@ func (s *Server) handleAppMembershipChange(ctx context.Context, memberType group
 	if memberType != groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_APP {
 		return nil
 	}
-	appID, err := uuid.Parse(memberID)
+	identityID, err := uuid.Parse(memberID)
 	if err != nil {
 		return fmt.Errorf("parse group membership member id: %w", err)
 	}
@@ -97,7 +97,7 @@ func (s *Server) handleAppMembershipChange(ctx context.Context, memberType group
 	if groupID != "" {
 		candidateRemoveAttributes = append(candidateRemoveAttributes, groupRoleAttribute(groupID))
 	}
-	return s.syncAppGroupRoles(ctx, appID, candidateRemoveAttributes)
+	return s.syncAppGroupRolesByIdentityID(ctx, identityID, candidateRemoveAttributes)
 }
 
 func (s *Server) ReconcileAllAppGroupRoles(ctx context.Context) error {
@@ -119,8 +119,8 @@ func (s *Server) ReconcileAllAppGroupRoles(ctx context.Context) error {
 	}
 }
 
-func (s *Server) syncAppGroupRoles(ctx context.Context, appID uuid.UUID, candidateRemoveAttributes []string) error {
-	app, err := s.store.GetApp(ctx, appID)
+func (s *Server) syncAppGroupRolesByIdentityID(ctx context.Context, identityID uuid.UUID, candidateRemoveAttributes []string) error {
+	app, err := s.store.GetAppByIdentityID(ctx, identityID)
 	if err != nil {
 		return err
 	}

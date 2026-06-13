@@ -2372,9 +2372,12 @@ func TestGroupMembershipEventPatchesCurrentAppIdentity(t *testing.T) {
 	organizationID := uuid.New()
 	identityID := uuid.New()
 	groupID := uuid.New().String()
-	fakeStore.getFn = func(_ context.Context, id uuid.UUID) (storepkg.App, error) {
-		if id != appID {
+	fakeStore.getByIdentityFn = func(_ context.Context, id uuid.UUID) (storepkg.App, error) {
+		if id != identityID {
 			return storepkg.App{}, storepkg.NotFound("app")
+		}
+		if id == appID {
+			t.Fatalf("event path used app row ID instead of identity ID")
 		}
 		return storepkg.App{
 			Meta:           storepkg.EntityMeta{ID: appID},
@@ -2388,7 +2391,7 @@ func TestGroupMembershipEventPatchesCurrentAppIdentity(t *testing.T) {
 	payload := mustMarshal(t, &groupsv1.GroupMembershipAddedEvent{
 		GroupId:    groupID,
 		MemberType: groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_APP,
-		MemberId:   appID.String(),
+		MemberId:   identityID.String(),
 	})
 
 	if err := srv.HandleGroupMembershipEvent(context.Background(), groupMembershipAddedSubject, payload); err != nil {
@@ -2415,13 +2418,15 @@ func TestGroupMembershipEventsAreDuplicateAndOutOfOrderSafe(t *testing.T) {
 
 	appID := uuid.New()
 	organizationID := uuid.New()
+	identityID := uuid.New()
 	groupID := uuid.New().String()
-	fakeStore.getFn = func(_ context.Context, id uuid.UUID) (storepkg.App, error) {
-		if id != appID {
+	fakeStore.getByIdentityFn = func(_ context.Context, id uuid.UUID) (storepkg.App, error) {
+		if id != identityID {
 			return storepkg.App{}, storepkg.NotFound("app")
 		}
 		return storepkg.App{
 			Meta:           storepkg.EntityMeta{ID: appID},
+			IdentityID:     identityID,
 			OrganizationID: organizationID,
 			ZitiIdentityID: "ziti-app-1",
 		}, nil
@@ -2431,12 +2436,12 @@ func TestGroupMembershipEventsAreDuplicateAndOutOfOrderSafe(t *testing.T) {
 	removed := mustMarshal(t, &groupsv1.GroupMembershipRemovedEvent{
 		GroupId:    groupID,
 		MemberType: groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_APP,
-		MemberId:   appID.String(),
+		MemberId:   identityID.String(),
 	})
 	added := mustMarshal(t, &groupsv1.GroupMembershipAddedEvent{
 		GroupId:    groupID,
 		MemberType: groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_APP,
-		MemberId:   appID.String(),
+		MemberId:   identityID.String(),
 	})
 
 	if err := srv.HandleGroupMembershipEvent(context.Background(), groupMembershipRemovedSubject, removed); err != nil {
