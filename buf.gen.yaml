@@ -27,3 +27,4 @@ inputs:
       - agynio/api/authorization/v1
       - agynio/api/identity/v1
       - agynio/api/ziti_management/v1
+      - agynio/api/groups/v1

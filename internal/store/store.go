@@ -20,7 +20,7 @@ const (
 	installationColumns = `id, app_id, organization_id, slug, configuration, status, created_at, updated_at`
 
 	defaultListPageSize = 50
-	maxListPageSize     = 100
+	MaxListPageSize     = 100
 )
 
 type EntityMeta struct {
@@ -581,8 +581,8 @@ func normalizePageSize(size int) int {
 	if size <= 0 {
 		return defaultListPageSize
 	}
-	if size > maxListPageSize {
-		return maxListPageSize
+	if size > MaxListPageSize {
+		return MaxListPageSize
 	}
 	return size
 }

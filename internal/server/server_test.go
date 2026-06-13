@@ -10,6 +10,7 @@ import (
 
 	appsv1 "github.com/agynio/apps/.gen/go/agynio/api/apps/v1"
 	authorizationv1 "github.com/agynio/apps/.gen/go/agynio/api/authorization/v1"
+	groupsv1 "github.com/agynio/apps/.gen/go/agynio/api/groups/v1"
 	identityv1 "github.com/agynio/apps/.gen/go/agynio/api/identity/v1"
 	zitimanagementv1 "github.com/agynio/apps/.gen/go/agynio/api/ziti_management/v1"
 	storepkg "github.com/agynio/apps/internal/store"
@@ -18,6 +19,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -377,6 +379,7 @@ type fakeZitiManagementClient struct {
 	createRequests        []*zitimanagementv1.CreateAppIdentityRequest
 	createServiceRequests []*zitimanagementv1.CreateServiceRequest
 	deleteRequests        []*zitimanagementv1.DeleteAppIdentityRequest
+	patchRequests         []*zitimanagementv1.PatchIdentityRoleAttributesRequest
 }
 
 func (f *fakeZitiManagementClient) CreateAgentIdentity(ctx context.Context, _ *zitimanagementv1.CreateAgentIdentityRequest, _ ...grpc.CallOption) (*zitimanagementv1.CreateAgentIdentityResponse, error) {
@@ -453,6 +456,11 @@ func (f *fakeZitiManagementClient) CreateDeviceIdentity(ctx context.Context, _ *
 
 func (f *fakeZitiManagementClient) DeleteDeviceIdentity(ctx context.Context, _ *zitimanagementv1.DeleteDeviceIdentityRequest, _ ...grpc.CallOption) (*zitimanagementv1.DeleteDeviceIdentityResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "not implemented")
+}
+
+func (f *fakeZitiManagementClient) PatchIdentityRoleAttributes(ctx context.Context, req *zitimanagementv1.PatchIdentityRoleAttributesRequest, _ ...grpc.CallOption) (*zitimanagementv1.PatchIdentityRoleAttributesResponse, error) {
+	f.patchRequests = append(f.patchRequests, req)
+	return &zitimanagementv1.PatchIdentityRoleAttributesResponse{}, nil
 }
 
 func newAdminContext() (context.Context, uuid.UUID) {
@@ -2300,4 +2308,303 @@ func TestListInstallationAuditLogEntriesRejectsNonMember(t *testing.T) {
 	if status.Code(err) != codes.PermissionDenied {
 		t.Fatalf("expected permission denied, got %v", status.Code(err))
 	}
+}
+
+func TestEnrollAppIncludesGroupAttrs(t *testing.T) {
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	fakeStore := &fakeStore{}
+
+	appID := uuid.New()
+	organizationID := uuid.New()
+	identityID := uuid.New()
+	groupA := uuid.New().String()
+	groupB := uuid.New().String()
+	fakeStore.updateZitiIdentityFn = func(context.Context, uuid.UUID, string, string) error { return nil }
+	fakeStore.getByServiceTokenFn = func(_ context.Context, _ string) (storepkg.App, error) {
+		return storepkg.App{
+			Meta:           storepkg.EntityMeta{ID: appID},
+			Slug:           "demo",
+			IdentityID:     identityID,
+			OrganizationID: organizationID,
+			ZitiServiceID:  "service-id",
+		}, nil
+	}
+	fakeGroups := &fakeGroupsClient{groupsByOrg: map[string][]*groupsv1.Group{
+		organizationID.String(): {{Meta: &groupsv1.EntityMeta{Id: groupB}}, {Meta: &groupsv1.EntityMeta{Id: groupA}}, {Meta: &groupsv1.EntityMeta{Id: groupA}}},
+	}}
+
+	srv := NewWithGroups(fakeStore, identityClient, authorizationClient, zitiClient, fakeGroups)
+	_, err := srv.EnrollApp(context.Background(), &appsv1.EnrollAppRequest{ServiceToken: "raw-token"})
+	if err != nil {
+		t.Fatalf("EnrollApp failed: %v", err)
+	}
+	if len(zitiClient.createRequests) != 1 {
+		t.Fatalf("expected one ziti create request")
+	}
+	request := zitiClient.createRequests[0]
+	if request.GetIdentityId() != identityID.String() {
+		t.Fatalf("expected app identity id %s, got %s", identityID, request.GetIdentityId())
+	}
+	if request.GetSlug() != "demo" {
+		t.Fatalf("expected slug demo, got %s", request.GetSlug())
+	}
+	assertStringSet(t, request.GetAdditionalRoleAttributes(), []string{groupRoleAttribute(groupA), groupRoleAttribute(groupB)})
+}
+
+func TestGroupMembershipEventPatchesCurrentAppIdentity(t *testing.T) {
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	fakeStore := &fakeStore{}
+
+	appID := uuid.New()
+	organizationID := uuid.New()
+	identityID := uuid.New()
+	groupID := uuid.New().String()
+	fakeStore.getFn = func(_ context.Context, id uuid.UUID) (storepkg.App, error) {
+		if id != appID {
+			return storepkg.App{}, storepkg.NotFound("app")
+		}
+		return storepkg.App{
+			Meta:           storepkg.EntityMeta{ID: appID},
+			IdentityID:     identityID,
+			OrganizationID: organizationID,
+			ZitiIdentityID: "ziti-app-1",
+		}, nil
+	}
+	fakeGroups := &fakeGroupsClient{groupsByOrg: map[string][]*groupsv1.Group{organizationID.String(): {{Meta: &groupsv1.EntityMeta{Id: groupID}}}}}
+	srv := NewWithGroups(fakeStore, identityClient, authorizationClient, zitiClient, fakeGroups)
+	payload := mustMarshal(t, &groupsv1.GroupMembershipAddedEvent{
+		GroupId:    groupID,
+		MemberType: groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_APP,
+		MemberId:   appID.String(),
+	})
+
+	if err := srv.HandleGroupMembershipEvent(context.Background(), groupMembershipAddedSubject, payload); err != nil {
+		t.Fatalf("HandleGroupMembershipEvent failed: %v", err)
+	}
+	if len(zitiClient.patchRequests) != 1 {
+		t.Fatalf("expected one patch request, got %d", len(zitiClient.patchRequests))
+	}
+	request := zitiClient.patchRequests[0]
+	if request.GetZitiIdentityId() != "ziti-app-1" {
+		t.Fatalf("expected ziti identity ziti-app-1, got %s", request.GetZitiIdentityId())
+	}
+	assertStringSet(t, request.GetAdd(), []string{groupRoleAttribute(groupID)})
+	if len(request.GetRemove()) != 0 {
+		t.Fatalf("expected no removals, got %v", request.GetRemove())
+	}
+}
+
+func TestGroupMembershipEventsAreDuplicateAndOutOfOrderSafe(t *testing.T) {
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	fakeStore := &fakeStore{}
+
+	appID := uuid.New()
+	organizationID := uuid.New()
+	groupID := uuid.New().String()
+	fakeStore.getFn = func(_ context.Context, id uuid.UUID) (storepkg.App, error) {
+		if id != appID {
+			return storepkg.App{}, storepkg.NotFound("app")
+		}
+		return storepkg.App{
+			Meta:           storepkg.EntityMeta{ID: appID},
+			OrganizationID: organizationID,
+			ZitiIdentityID: "ziti-app-1",
+		}, nil
+	}
+	fakeGroups := &fakeGroupsClient{groupsByOrg: map[string][]*groupsv1.Group{organizationID.String(): {}}}
+	srv := NewWithGroups(fakeStore, identityClient, authorizationClient, zitiClient, fakeGroups)
+	removed := mustMarshal(t, &groupsv1.GroupMembershipRemovedEvent{
+		GroupId:    groupID,
+		MemberType: groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_APP,
+		MemberId:   appID.String(),
+	})
+	added := mustMarshal(t, &groupsv1.GroupMembershipAddedEvent{
+		GroupId:    groupID,
+		MemberType: groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_APP,
+		MemberId:   appID.String(),
+	})
+
+	if err := srv.HandleGroupMembershipEvent(context.Background(), groupMembershipRemovedSubject, removed); err != nil {
+		t.Fatalf("remove event failed: %v", err)
+	}
+	if err := srv.HandleGroupMembershipEvent(context.Background(), groupMembershipRemovedSubject, removed); err != nil {
+		t.Fatalf("duplicate remove event failed: %v", err)
+	}
+	if err := srv.HandleGroupMembershipEvent(context.Background(), groupMembershipAddedSubject, added); err != nil {
+		t.Fatalf("out-of-order add event failed: %v", err)
+	}
+	if len(zitiClient.patchRequests) != 3 {
+		t.Fatalf("expected three patch requests, got %d", len(zitiClient.patchRequests))
+	}
+	for _, request := range zitiClient.patchRequests {
+		if len(request.GetAdd()) != 0 {
+			t.Fatalf("expected no adds while source-of-truth is empty, got %v", request.GetAdd())
+		}
+		assertStringSet(t, request.GetRemove(), []string{groupRoleAttribute(groupID)})
+	}
+
+	fakeGroups.groupsByOrg[organizationID.String()] = []*groupsv1.Group{{Meta: &groupsv1.EntityMeta{Id: groupID}}}
+	if err := srv.HandleGroupMembershipEvent(context.Background(), groupMembershipAddedSubject, added); err != nil {
+		t.Fatalf("add event failed: %v", err)
+	}
+	last := zitiClient.patchRequests[len(zitiClient.patchRequests)-1]
+	assertStringSet(t, last.GetAdd(), []string{groupRoleAttribute(groupID)})
+	if len(last.GetRemove()) != 0 {
+		t.Fatalf("expected no removal for desired group, got %v", last.GetRemove())
+	}
+}
+
+func TestReconcileAllAppGroupRolesPatchesMissingDesiredAttrs(t *testing.T) {
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	fakeStore := &fakeStore{}
+
+	appID := uuid.New()
+	organizationID := uuid.New()
+	groupID := uuid.New().String()
+	fakeStore.listFn = func(_ context.Context, pageSize int, pageToken string, _ storepkg.ListAppsFilter) ([]storepkg.App, string, error) {
+		if pageSize != storepkg.MaxListPageSize {
+			t.Fatalf("expected max page size %d, got %d", storepkg.MaxListPageSize, pageSize)
+		}
+		if pageToken != "" {
+			return nil, "", nil
+		}
+		return []storepkg.App{{
+			Meta:           storepkg.EntityMeta{ID: appID},
+			OrganizationID: organizationID,
+			ZitiIdentityID: "ziti-app-1",
+		}}, "", nil
+	}
+	fakeGroups := &fakeGroupsClient{groupsByOrg: map[string][]*groupsv1.Group{organizationID.String(): {{Meta: &groupsv1.EntityMeta{Id: groupID}}}}}
+	srv := NewWithGroups(fakeStore, identityClient, authorizationClient, zitiClient, fakeGroups)
+
+	if err := srv.ReconcileAllAppGroupRoles(context.Background()); err != nil {
+		t.Fatalf("ReconcileAllAppGroupRoles failed: %v", err)
+	}
+	if len(zitiClient.patchRequests) != 1 {
+		t.Fatalf("expected one patch request, got %d", len(zitiClient.patchRequests))
+	}
+	request := zitiClient.patchRequests[0]
+	if request.GetZitiIdentityId() != "ziti-app-1" {
+		t.Fatalf("expected ziti identity ziti-app-1, got %s", request.GetZitiIdentityId())
+	}
+	assertStringSet(t, request.GetAdd(), []string{groupRoleAttribute(groupID)})
+	if len(request.GetRemove()) != 0 {
+		t.Fatalf("expected no removals, got %v", request.GetRemove())
+	}
+}
+
+func TestGroupMembershipConsumerLoopRetriesWithoutBlocking(t *testing.T) {
+	originalInitial := groupMembershipRetryInitial
+	originalMax := groupMembershipRetryMax
+	groupMembershipRetryInitial = time.Millisecond
+	groupMembershipRetryMax = time.Millisecond
+	defer func() {
+		groupMembershipRetryInitial = originalInitial
+		groupMembershipRetryMax = originalMax
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	subscription := &fakeGroupMembershipSubscription{}
+	attempts := make(chan int, 3)
+	srv := NewWithGroups(&fakeStore{}, &fakeIdentityClient{}, &fakeAuthorizationClient{}, &fakeZitiManagementClient{}, nil)
+
+	srv.StartGroupMembershipConsumerLoopWithSubscriber(ctx, func(context.Context) (groupMembershipSubscription, error) {
+		attempts <- len(attempts) + 1
+		if len(attempts) < 2 {
+			return nil, fmt.Errorf("nats unavailable")
+		}
+		return subscription, nil
+	})
+
+	deadline := time.After(time.Second)
+	for len(attempts) < 2 {
+		select {
+		case <-deadline:
+			t.Fatalf("expected retry without blocking")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if subscription.unsubscribed {
+		t.Fatalf("did not expect unsubscribe before cancellation")
+	}
+	cancel()
+	deadline = time.After(time.Second)
+	for !subscription.unsubscribed {
+		select {
+		case <-deadline:
+			t.Fatalf("expected unsubscribe after cancellation")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+func mustMarshal(t *testing.T, message proto.Message) []byte {
+	t.Helper()
+	data, err := proto.Marshal(message)
+	if err != nil {
+		t.Fatalf("marshal message: %v", err)
+	}
+	return data
+}
+
+func assertStringSet(t *testing.T, actual []string, expected []string) {
+	t.Helper()
+	if len(actual) != len(expected) {
+		t.Fatalf("expected %v, got %v", expected, actual)
+	}
+	counts := map[string]int{}
+	for _, value := range actual {
+		counts[value]++
+	}
+	for _, value := range expected {
+		counts[value]--
+	}
+	for value, count := range counts {
+		if count != 0 {
+			t.Fatalf("expected %v, got %v; mismatch on %s", expected, actual, value)
+		}
+	}
+}
+
+type fakeGroupsClient struct {
+	groupsByOrg      map[string][]*groupsv1.Group
+	pagedGroupsByOrg map[string][][]*groupsv1.Group
+}
+
+func (c *fakeGroupsClient) ListMemberGroups(_ context.Context, request *groupsv1.ListMemberGroupsRequest, _ ...grpc.CallOption) (*groupsv1.ListMemberGroupsResponse, error) {
+	if c.pagedGroupsByOrg != nil {
+		pages := c.pagedGroupsByOrg[request.GetOrganizationId()]
+		pageIndex := 0
+		if request.GetPageToken() != "" {
+			if _, err := fmt.Sscanf(request.GetPageToken(), "page-%d", &pageIndex); err != nil {
+				return nil, err
+			}
+		}
+		response := &groupsv1.ListMemberGroupsResponse{Groups: append([]*groupsv1.Group{}, pages[pageIndex]...)}
+		if pageIndex+1 < len(pages) {
+			response.NextPageToken = fmt.Sprintf("page-%d", pageIndex+1)
+		}
+		return response, nil
+	}
+	return &groupsv1.ListMemberGroupsResponse{Groups: append([]*groupsv1.Group{}, c.groupsByOrg[request.GetOrganizationId()]...)}, nil
+}
+
+type fakeGroupMembershipSubscription struct {
+	unsubscribed bool
+}
+
+func (s *fakeGroupMembershipSubscription) Unsubscribe() error {
+	s.unsubscribed = true
+	return nil
 }
