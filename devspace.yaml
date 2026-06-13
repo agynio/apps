@@ -126,7 +126,8 @@ pipelines:
             --path agynio/api/apps/v1 \
             --path agynio/api/authorization/v1 \
             --path agynio/api/identity/v1 \
-            --path agynio/api/ziti_management/v1
+            --path agynio/api/ziti_management/v1 \
+            --path agynio/api/groups/v1
           nohup "${GO_BIN}" run ./cmd/apps-service >/tmp/apps-service.log 2>&1 &
         '
         echo "Waiting for apps to be healthy on :50051..."
