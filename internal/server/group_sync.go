@@ -50,7 +50,7 @@ func (s *Server) listAppGroups(ctx context.Context, app store.App) ([]*groupsv1.
 	for {
 		response, err := s.groupsClient.ListMemberGroups(ctx, &groupsv1.ListMemberGroupsRequest{
 			MemberType:     groupsv1.GroupMemberType_GROUP_MEMBER_TYPE_APP,
-			MemberId:       app.Meta.ID.String(),
+			MemberId:       app.IdentityID.String(),
 			OrganizationId: app.OrganizationID.String(),
 			PageSize:       int32(store.MaxListPageSize),
 			PageToken:      pageToken,

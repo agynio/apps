@@ -2351,6 +2351,15 @@ func TestEnrollAppIncludesGroupAttrs(t *testing.T) {
 		t.Fatalf("expected slug demo, got %s", request.GetSlug())
 	}
 	assertStringSet(t, request.GetAdditionalRoleAttributes(), []string{groupRoleAttribute(groupA), groupRoleAttribute(groupB)})
+	if len(fakeGroups.requests) != 1 {
+		t.Fatalf("expected one groups lookup, got %d", len(fakeGroups.requests))
+	}
+	if fakeGroups.requests[0].GetMemberId() != identityID.String() {
+		t.Fatalf("expected groups lookup by app identity ID %s, got %s", identityID, fakeGroups.requests[0].GetMemberId())
+	}
+	if fakeGroups.requests[0].GetMemberId() == appID.String() {
+		t.Fatalf("groups lookup used app row ID instead of identity ID")
+	}
 }
 
 func TestGroupMembershipEventPatchesCurrentAppIdentity(t *testing.T) {
@@ -2580,9 +2589,11 @@ func assertStringSet(t *testing.T, actual []string, expected []string) {
 type fakeGroupsClient struct {
 	groupsByOrg      map[string][]*groupsv1.Group
 	pagedGroupsByOrg map[string][][]*groupsv1.Group
+	requests         []*groupsv1.ListMemberGroupsRequest
 }
 
 func (c *fakeGroupsClient) ListMemberGroups(_ context.Context, request *groupsv1.ListMemberGroupsRequest, _ ...grpc.CallOption) (*groupsv1.ListMemberGroupsResponse, error) {
+	c.requests = append(c.requests, request)
 	if c.pagedGroupsByOrg != nil {
 		pages := c.pagedGroupsByOrg[request.GetOrganizationId()]
 		pageIndex := 0
