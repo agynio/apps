@@ -31,6 +31,10 @@ var permissionToRelation = map[string]string{
 	"thread:create":   "thread_create",
 	"thread:write":    "thread_write",
 	"participant:add": "participant_add",
+	// The authorization model grants an agent instance's can_write_inbox from
+	// its organization's inbox_write; without this entry no app can be granted
+	// that relation, so direct inbox writes are unreachable.
+	"inbox:write": "inbox_write",
 }
 
 type AppStore interface {

@@ -14,6 +14,13 @@ func TestValidatePermissions(t *testing.T) {
 			wantErr:     false,
 		},
 		{
+			// Without it in the vocabulary the inbox_write relation the
+			// authorization model defines can never be granted to an app.
+			name:        "inbox write",
+			permissions: []string{"inbox:write"},
+			wantErr:     false,
+		},
+		{
 			name:        "unknown",
 			permissions: []string{"unknown"},
 			wantErr:     true,
