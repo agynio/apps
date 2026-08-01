@@ -162,7 +162,6 @@ dev:
     namespace: ${APPS_NAMESPACE}
     labelSelector:
       app.kubernetes.io/name: apps
-      app.kubernetes.io/instance: apps
     containers:
       apps:
         container: apps
