@@ -115,6 +115,13 @@ func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
 
+func nonNilStrings(values []string) []string {
+	if values == nil {
+		return []string{}
+	}
+	return values
+}
+
 func scanApp(row pgx.Row) (App, error) {
 	var app App
 	if err := row.Scan(
@@ -175,7 +182,11 @@ func (s *Store) CreateApp(ctx context.Context, input CreateAppInput) (App, error
 		input.ZitiServiceID,
 		input.OrganizationID,
 		input.Visibility,
-		input.Permissions,
+		// A nil slice binds as SQL NULL, and the column is NOT NULL. Its
+		// DEFAULT cannot stand in either: naming the column in the INSERT is
+		// what disables the default. An app with no permissions is ordinary,
+		// so it gets an empty array.
+		nonNilStrings(input.Permissions),
 	)
 	app, err := scanApp(row)
 	if err != nil {
