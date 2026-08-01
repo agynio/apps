@@ -9,6 +9,7 @@ import (
 	zitimanagementv1 "github.com/agynio/apps/.gen/go/agynio/api/ziti_management/v1"
 	"github.com/agynio/apps/internal/store"
 	"github.com/google/uuid"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -45,6 +46,13 @@ func (s *Server) appGroupRoleAttributes(ctx context.Context, app store.App) ([]s
 }
 
 func (s *Server) listAppGroups(ctx context.Context, app store.App) ([]*groupsv1.Group, error) {
+	// As the app, not as whoever happens to be on the inbound context. Groups
+	// lets a member list its own memberships and otherwise demands organization
+	// membership -- and the two callers here have no user identity to forward:
+	// EnrollApp authenticates with the app's service token, and the membership
+	// event handler runs off NATS with no caller at all. Both used to arrive
+	// with nothing and were refused outright.
+	ctx = metadata.AppendToOutgoingContext(ctx, identityMetadata, app.IdentityID.String())
 	groups := []*groupsv1.Group{}
 	pageToken := ""
 	for {
