@@ -2310,6 +2310,42 @@ func TestListInstallationAuditLogEntriesRejectsNonMember(t *testing.T) {
 	}
 }
 
+// Groups lets a member list its own memberships and otherwise demands
+// organization membership. EnrollApp authenticates with a service token and
+// carries no user identity, so unless the app names itself the call is refused
+// and no app can ever enroll.
+func TestEnrollAppListsGroupsAsTheApp(t *testing.T) {
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	fakeStore := &fakeStore{}
+
+	identityID := uuid.New()
+	organizationID := uuid.New()
+	fakeStore.updateZitiIdentityFn = func(context.Context, uuid.UUID, string, string) error { return nil }
+	fakeStore.getByServiceTokenFn = func(_ context.Context, _ string) (storepkg.App, error) {
+		return storepkg.App{
+			Meta:           storepkg.EntityMeta{ID: uuid.New()},
+			Slug:           "demo",
+			IdentityID:     identityID,
+			OrganizationID: organizationID,
+			ZitiServiceID:  "service-id",
+		}, nil
+	}
+	fakeGroups := &fakeGroupsClient{groupsByOrg: map[string][]*groupsv1.Group{}}
+
+	srv := NewWithGroups(fakeStore, identityClient, authorizationClient, zitiClient, fakeGroups)
+	if _, err := srv.EnrollApp(context.Background(), &appsv1.EnrollAppRequest{ServiceToken: "raw-token"}); err != nil {
+		t.Fatalf("EnrollApp failed: %v", err)
+	}
+	if len(fakeGroups.callerIdentities) != 1 {
+		t.Fatalf("expected one groups lookup, got %d", len(fakeGroups.callerIdentities))
+	}
+	if fakeGroups.callerIdentities[0] != identityID.String() {
+		t.Fatalf("expected the groups lookup to name the app identity %s, got %q", identityID, fakeGroups.callerIdentities[0])
+	}
+}
+
 func TestEnrollAppIncludesGroupAttrs(t *testing.T) {
 	identityClient := &fakeIdentityClient{}
 	authorizationClient := &fakeAuthorizationClient{}
@@ -2595,10 +2631,18 @@ type fakeGroupsClient struct {
 	groupsByOrg      map[string][]*groupsv1.Group
 	pagedGroupsByOrg map[string][][]*groupsv1.Group
 	requests         []*groupsv1.ListMemberGroupsRequest
+	callerIdentities []string
 }
 
-func (c *fakeGroupsClient) ListMemberGroups(_ context.Context, request *groupsv1.ListMemberGroupsRequest, _ ...grpc.CallOption) (*groupsv1.ListMemberGroupsResponse, error) {
+func (c *fakeGroupsClient) ListMemberGroups(ctx context.Context, request *groupsv1.ListMemberGroupsRequest, _ ...grpc.CallOption) (*groupsv1.ListMemberGroupsResponse, error) {
 	c.requests = append(c.requests, request)
+	caller := ""
+	if md, ok := metadata.FromOutgoingContext(ctx); ok {
+		if values := md.Get(identityMetadata); len(values) == 1 {
+			caller = values[0]
+		}
+	}
+	c.callerIdentities = append(c.callerIdentities, caller)
 	if c.pagedGroupsByOrg != nil {
 		pages := c.pagedGroupsByOrg[request.GetOrganizationId()]
 		pageIndex := 0
