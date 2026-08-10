@@ -336,8 +336,18 @@ func (f *fakeIdentityClient) BatchGetNicknames(ctx context.Context, _ *identityv
 type fakeAuthorizationClient struct {
 	checkFn       func(ctx context.Context, req *authorizationv1.CheckRequest) (*authorizationv1.CheckResponse, error)
 	writeFn       func(ctx context.Context, req *authorizationv1.WriteRequest) (*authorizationv1.WriteResponse, error)
+	readFn        func(ctx context.Context, req *authorizationv1.ReadRequest) (*authorizationv1.ReadResponse, error)
 	checkRequests []*authorizationv1.CheckRequest
 	writeRequests []*authorizationv1.WriteRequest
+	readRequests  []*authorizationv1.ReadRequest
+}
+
+func (f *fakeAuthorizationClient) Read(ctx context.Context, req *authorizationv1.ReadRequest, _ ...grpc.CallOption) (*authorizationv1.ReadResponse, error) {
+	f.readRequests = append(f.readRequests, req)
+	if f.readFn != nil {
+		return f.readFn(ctx, req)
+	}
+	return &authorizationv1.ReadResponse{}, nil
 }
 
 func (f *fakeAuthorizationClient) Check(ctx context.Context, req *authorizationv1.CheckRequest, _ ...grpc.CallOption) (*authorizationv1.CheckResponse, error) {
@@ -358,10 +368,6 @@ func (f *fakeAuthorizationClient) Write(ctx context.Context, req *authorizationv
 		return f.writeFn(ctx, req)
 	}
 	return &authorizationv1.WriteResponse{}, nil
-}
-
-func (f *fakeAuthorizationClient) Read(ctx context.Context, _ *authorizationv1.ReadRequest, _ ...grpc.CallOption) (*authorizationv1.ReadResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "not implemented")
 }
 
 func (f *fakeAuthorizationClient) ListObjects(ctx context.Context, _ *authorizationv1.ListObjectsRequest, _ ...grpc.CallOption) (*authorizationv1.ListObjectsResponse, error) {
@@ -1945,6 +1951,13 @@ func TestUninstallAppDeletesTuplesBeforeStore(t *testing.T) {
 		order = append(order, "delete")
 		return nil
 	}
+	// Both relations are already written, so cleanup has both to delete.
+	authorizationClient.readFn = func(_ context.Context, _ *authorizationv1.ReadRequest) (*authorizationv1.ReadResponse, error) {
+		return &authorizationv1.ReadResponse{Tuples: []*authorizationv1.Tuple{
+			{Key: &authorizationv1.TupleKey{Relation: "member"}},
+			{Key: &authorizationv1.TupleKey{Relation: "thread_create"}},
+		}}, nil
+	}
 	authorizationClient.writeFn = func(_ context.Context, req *authorizationv1.WriteRequest) (*authorizationv1.WriteResponse, error) {
 		if len(req.Deletes) != 2 {
 			return nil, errors.New("expected membership plus thread_create deletes")
@@ -2742,5 +2755,140 @@ func TestInstallationTuplesReportsUnknownPermission(t *testing.T) {
 	}
 	if tuples[0].GetRelation() != "member" {
 		t.Fatalf("membership should be written first, got %s", tuples[0].GetRelation())
+	}
+}
+
+// An installation predating the membership tuple has permissions but no
+// membership. A delete batch naming an absent tuple is rejected whole, so
+// cleanup would remove nothing and leave the org unable to reinstall.
+func TestUninstallSkipsTuplesThatWereNeverWritten(t *testing.T) {
+	ctx, _ := newAdminContext()
+	authorizationClient := &fakeAuthorizationClient{}
+	store := &fakeStore{}
+
+	installationID, appID, organizationID := uuid.New(), uuid.New(), uuid.New()
+	store.getInstallationFn = func(_ context.Context, _ uuid.UUID) (storepkg.Installation, error) {
+		return storepkg.Installation{
+			Meta:           storepkg.EntityMeta{ID: installationID},
+			AppID:          appID,
+			OrganizationID: organizationID,
+		}, nil
+	}
+	store.getFn = func(_ context.Context, _ uuid.UUID) (storepkg.App, error) {
+		return storepkg.App{
+			Meta:           storepkg.EntityMeta{ID: appID},
+			IdentityID:     uuid.New(),
+			OrganizationID: organizationID,
+			Permissions:    []string{"thread:create"},
+		}, nil
+	}
+	store.deleteInstallationFn = func(_ context.Context, _ uuid.UUID) error { return nil }
+	// Only the permission was ever written.
+	authorizationClient.readFn = func(_ context.Context, _ *authorizationv1.ReadRequest) (*authorizationv1.ReadResponse, error) {
+		return &authorizationv1.ReadResponse{Tuples: []*authorizationv1.Tuple{
+			{Key: &authorizationv1.TupleKey{Relation: "thread_create"}},
+		}}, nil
+	}
+	authorizationClient.writeFn = func(_ context.Context, req *authorizationv1.WriteRequest) (*authorizationv1.WriteResponse, error) {
+		if len(req.Deletes) != 1 || req.Deletes[0].GetRelation() != "thread_create" {
+			return nil, fmt.Errorf("expected only thread_create deleted, got %v", req.Deletes)
+		}
+		return &authorizationv1.WriteResponse{}, nil
+	}
+
+	srv := New(store, &fakeIdentityClient{}, authorizationClient, &fakeZitiManagementClient{})
+	if _, err := srv.UninstallApp(ctx, &appsv1.UninstallAppRequest{Id: installationID.String()}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(authorizationClient.writeRequests) != 1 {
+		t.Fatalf("expected the present tuple to be deleted, got %d writes", len(authorizationClient.writeRequests))
+	}
+}
+
+// Reinstalling over tuples a failed uninstall left behind must not fail on
+// AlreadyExists — a write batch naming one existing tuple is rejected whole.
+func TestInstallSkipsTuplesThatAlreadyExist(t *testing.T) {
+	ctx, _ := newAdminContext()
+	authorizationClient := &fakeAuthorizationClient{}
+	store := &fakeStore{}
+
+	appID, organizationID, appIdentityID := uuid.New(), uuid.New(), uuid.New()
+	store.getFn = func(_ context.Context, _ uuid.UUID) (storepkg.App, error) {
+		return storepkg.App{
+			Meta:           storepkg.EntityMeta{ID: appID},
+			Slug:           "demo",
+			OrganizationID: organizationID,
+			Visibility:     storepkg.AppVisibilityInternal,
+			IdentityID:     appIdentityID,
+			Permissions:    []string{"thread:create", "participant:add"},
+		}, nil
+	}
+	store.createInstallationFn = func(_ context.Context, input storepkg.CreateInstallationInput) (storepkg.Installation, error) {
+		return storepkg.Installation{
+			Meta:           storepkg.EntityMeta{ID: input.ID, CreatedAt: time.Now(), UpdatedAt: time.Now()},
+			AppID:          input.AppID,
+			OrganizationID: input.OrganizationID,
+			Slug:           input.Slug,
+		}, nil
+	}
+	// Orphans from an uninstall that could not complete.
+	authorizationClient.readFn = func(_ context.Context, _ *authorizationv1.ReadRequest) (*authorizationv1.ReadResponse, error) {
+		return &authorizationv1.ReadResponse{Tuples: []*authorizationv1.Tuple{
+			{Key: &authorizationv1.TupleKey{Relation: "thread_create"}},
+			{Key: &authorizationv1.TupleKey{Relation: "participant_add"}},
+		}}, nil
+	}
+	authorizationClient.writeFn = func(_ context.Context, req *authorizationv1.WriteRequest) (*authorizationv1.WriteResponse, error) {
+		if len(req.Writes) != 1 || req.Writes[0].GetRelation() != "member" {
+			return nil, fmt.Errorf("expected only membership written, got %v", req.Writes)
+		}
+		return &authorizationv1.WriteResponse{}, nil
+	}
+
+	srv := New(store, &fakeIdentityClient{}, authorizationClient, &fakeZitiManagementClient{})
+	if _, err := srv.InstallApp(ctx, &appsv1.InstallAppRequest{AppId: appID.String(), OrganizationId: organizationID.String()}); err != nil {
+		t.Fatalf("reinstall over existing tuples must succeed, got: %v", err)
+	}
+}
+
+// Nothing missing, nothing to write — and no Write call at all, since an empty
+// batch is itself an error.
+func TestInstallWritesNothingWhenEverythingExists(t *testing.T) {
+	ctx, _ := newAdminContext()
+	authorizationClient := &fakeAuthorizationClient{}
+	store := &fakeStore{}
+
+	appID, organizationID := uuid.New(), uuid.New()
+	store.getFn = func(_ context.Context, _ uuid.UUID) (storepkg.App, error) {
+		return storepkg.App{
+			Meta:           storepkg.EntityMeta{ID: appID},
+			Slug:           "demo",
+			OrganizationID: organizationID,
+			Visibility:     storepkg.AppVisibilityInternal,
+			IdentityID:     uuid.New(),
+			Permissions:    []string{"thread:create"},
+		}, nil
+	}
+	store.createInstallationFn = func(_ context.Context, input storepkg.CreateInstallationInput) (storepkg.Installation, error) {
+		return storepkg.Installation{
+			Meta:           storepkg.EntityMeta{ID: input.ID, CreatedAt: time.Now(), UpdatedAt: time.Now()},
+			AppID:          input.AppID,
+			OrganizationID: input.OrganizationID,
+			Slug:           input.Slug,
+		}, nil
+	}
+	authorizationClient.readFn = func(_ context.Context, _ *authorizationv1.ReadRequest) (*authorizationv1.ReadResponse, error) {
+		return &authorizationv1.ReadResponse{Tuples: []*authorizationv1.Tuple{
+			{Key: &authorizationv1.TupleKey{Relation: "member"}},
+			{Key: &authorizationv1.TupleKey{Relation: "thread_create"}},
+		}}, nil
+	}
+
+	srv := New(store, &fakeIdentityClient{}, authorizationClient, &fakeZitiManagementClient{})
+	if _, err := srv.InstallApp(ctx, &appsv1.InstallAppRequest{AppId: appID.String(), OrganizationId: organizationID.String()}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(authorizationClient.writeRequests) != 0 {
+		t.Fatalf("expected no write, got %d", len(authorizationClient.writeRequests))
 	}
 }

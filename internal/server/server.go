@@ -882,12 +882,58 @@ func installationTuples(app store.App, organizationID uuid.UUID) (tuples []*auth
 	return tuples, ""
 }
 
+// existingInstallationRelations reads which of an app's org-level relations are
+// already written.
+//
+// A Write batch is atomic and OpenFGA rejects the whole of it for writing a
+// tuple that exists or deleting one that does not. Neither direction can be
+// assumed: an installation predating the membership tuple has permissions
+// without membership, and one whose uninstall was rejected leaves permissions
+// behind for the next install to trip over. So both paths reconcile against
+// what is there rather than against what they expect.
+func (s *Server) existingInstallationRelations(ctx context.Context, app store.App, organizationID uuid.UUID) (map[string]bool, error) {
+	relations := map[string]bool{}
+	pageToken := ""
+	for {
+		resp, err := s.authorizationClient.Read(ctx, &authorizationv1.ReadRequest{
+			TupleKey: &authorizationv1.TupleKey{
+				User:   fmt.Sprintf("identity:%s", app.IdentityID.String()),
+				Object: fmt.Sprintf("organization:%s", organizationID.String()),
+			},
+			PageToken: pageToken,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, tuple := range resp.GetTuples() {
+			relations[tuple.GetKey().GetRelation()] = true
+		}
+		pageToken = resp.GetNextPageToken()
+		if pageToken == "" {
+			return relations, nil
+		}
+	}
+}
+
 func (s *Server) writeInstallationTuples(ctx context.Context, app store.App, organizationID uuid.UUID) error {
 	tuples, unknown := installationTuples(app, organizationID)
 	if unknown != "" {
 		return status.Errorf(codes.Internal, "unknown permission %q", unknown)
 	}
-	if _, err := s.authorizationClient.Write(ctx, &authorizationv1.WriteRequest{Writes: tuples}); err != nil {
+	existing, err := s.existingInstallationRelations(ctx, app, organizationID)
+	if err != nil {
+		return status.Errorf(codes.Internal, "authorization read: %v", err)
+	}
+	writes := make([]*authorizationv1.TupleKey, 0, len(tuples))
+	for _, tuple := range tuples {
+		if !existing[tuple.GetRelation()] {
+			writes = append(writes, tuple)
+		}
+	}
+	if len(writes) == 0 {
+		return nil
+	}
+	if _, err := s.authorizationClient.Write(ctx, &authorizationv1.WriteRequest{Writes: writes}); err != nil {
 		return status.Errorf(codes.Internal, "authorization write: %v", err)
 	}
 	return nil
@@ -900,7 +946,23 @@ func (s *Server) deleteInstallationTuples(ctx context.Context, app store.App, or
 	if unknown != "" {
 		log.Printf("ERROR: unknown permission %q for installation cleanup", unknown)
 	}
-	if _, err := s.authorizationClient.Write(ctx, &authorizationv1.WriteRequest{Deletes: tuples}); err != nil {
+	existing, err := s.existingInstallationRelations(ctx, app, organizationID)
+	if err != nil {
+		// Without the read there is nothing safe to send: a batch naming one
+		// absent tuple deletes none of them.
+		log.Printf("WARN: best-effort cleanup of installation tuples for org %s skipped, authorization read failed: %v", organizationID, err)
+		return
+	}
+	deletes := make([]*authorizationv1.TupleKey, 0, len(tuples))
+	for _, tuple := range tuples {
+		if existing[tuple.GetRelation()] {
+			deletes = append(deletes, tuple)
+		}
+	}
+	if len(deletes) == 0 {
+		return
+	}
+	if _, err := s.authorizationClient.Write(ctx, &authorizationv1.WriteRequest{Deletes: deletes}); err != nil {
 		log.Printf("WARN: best-effort cleanup of installation tuples for org %s failed: %v", organizationID, err)
 	}
 }
