@@ -1828,8 +1828,8 @@ func TestInstallAppWritesPermissionTuples(t *testing.T) {
 		}, nil
 	}
 	authorizationClient.writeFn = func(_ context.Context, req *authorizationv1.WriteRequest) (*authorizationv1.WriteResponse, error) {
-		if len(req.Writes) != 3 {
-			return nil, errors.New("expected three permission tuples")
+		if len(req.Writes) != 4 {
+			return nil, errors.New("expected membership plus three permission tuples")
 		}
 		relations := map[string]bool{}
 		for _, tuple := range req.Writes {
@@ -1841,7 +1841,7 @@ func TestInstallAppWritesPermissionTuples(t *testing.T) {
 			}
 			relations[tuple.GetRelation()] = true
 		}
-		for _, relation := range []string{"thread_create", "thread_write", "participant_add"} {
+		for _, relation := range []string{"member", "thread_create", "thread_write", "participant_add"} {
 			if !relations[relation] {
 				return nil, fmt.Errorf("missing relation %s", relation)
 			}
@@ -1946,11 +1946,15 @@ func TestUninstallAppDeletesTuplesBeforeStore(t *testing.T) {
 		return nil
 	}
 	authorizationClient.writeFn = func(_ context.Context, req *authorizationv1.WriteRequest) (*authorizationv1.WriteResponse, error) {
-		if len(req.Deletes) != 1 {
-			return nil, errors.New("expected delete tuples")
+		if len(req.Deletes) != 2 {
+			return nil, errors.New("expected membership plus thread_create deletes")
 		}
-		if req.Deletes[0].GetRelation() != "thread_create" {
-			return nil, errors.New("expected thread_create relation")
+		relations := map[string]bool{}
+		for _, tuple := range req.Deletes {
+			relations[tuple.GetRelation()] = true
+		}
+		if !relations["member"] || !relations["thread_create"] {
+			return nil, fmt.Errorf("unexpected delete relations %v", relations)
 		}
 		order = append(order, "auth")
 		return &authorizationv1.WriteResponse{}, nil
@@ -2667,4 +2671,76 @@ type fakeGroupMembershipSubscription struct {
 func (s *fakeGroupMembershipSubscription) Unsubscribe() error {
 	s.unsubscribed = true
 	return nil
+}
+
+// An app declaring no permissions still becomes a member. The previous code
+// returned early on an empty permission set and wrote nothing at all.
+func TestInstallAppWritesMembershipWithoutDeclaredPermissions(t *testing.T) {
+	ctx, _ := newAdminContext()
+	identityClient := &fakeIdentityClient{}
+	authorizationClient := &fakeAuthorizationClient{}
+	zitiClient := &fakeZitiManagementClient{}
+	store := &fakeStore{}
+
+	appID := uuid.New()
+	organizationID := uuid.New()
+	appIdentityID := uuid.New()
+	store.getFn = func(_ context.Context, _ uuid.UUID) (storepkg.App, error) {
+		return storepkg.App{
+			Meta:           storepkg.EntityMeta{ID: appID},
+			Slug:           "demo",
+			OrganizationID: organizationID,
+			Visibility:     storepkg.AppVisibilityInternal,
+			IdentityID:     appIdentityID,
+		}, nil
+	}
+	store.createInstallationFn = func(_ context.Context, input storepkg.CreateInstallationInput) (storepkg.Installation, error) {
+		return storepkg.Installation{
+			Meta:           storepkg.EntityMeta{ID: input.ID, CreatedAt: time.Now(), UpdatedAt: time.Now()},
+			AppID:          input.AppID,
+			OrganizationID: input.OrganizationID,
+			Slug:           input.Slug,
+		}, nil
+	}
+	authorizationClient.writeFn = func(_ context.Context, req *authorizationv1.WriteRequest) (*authorizationv1.WriteResponse, error) {
+		if len(req.Writes) != 1 {
+			return nil, fmt.Errorf("expected only the membership tuple, got %d", len(req.Writes))
+		}
+		tuple := req.Writes[0]
+		if tuple.GetRelation() != "member" {
+			return nil, fmt.Errorf("unexpected relation %s", tuple.GetRelation())
+		}
+		if tuple.GetUser() != fmt.Sprintf("identity:%s", appIdentityID) {
+			return nil, fmt.Errorf("unexpected user %s", tuple.GetUser())
+		}
+		if tuple.GetObject() != fmt.Sprintf("organization:%s", organizationID) {
+			return nil, fmt.Errorf("unexpected object %s", tuple.GetObject())
+		}
+		return &authorizationv1.WriteResponse{}, nil
+	}
+
+	srv := New(store, identityClient, authorizationClient, zitiClient)
+	if _, err := srv.InstallApp(ctx, &appsv1.InstallAppRequest{AppId: appID.String(), OrganizationId: organizationID.String()}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(authorizationClient.writeRequests) != 1 {
+		t.Fatalf("expected membership to be written")
+	}
+}
+
+func TestInstallationTuplesReportsUnknownPermission(t *testing.T) {
+	app := storepkg.App{IdentityID: uuid.New(), Permissions: []string{"thread:create", "not:a:permission"}}
+	tuples, unknown := installationTuples(app, uuid.New())
+
+	if unknown != "not:a:permission" {
+		t.Fatalf("unknown = %q, want the undeclared permission", unknown)
+	}
+	// Membership and the relations resolved before the unknown one survive, so
+	// cleanup has something to delete.
+	if len(tuples) != 2 {
+		t.Fatalf("expected membership + thread_create, got %d", len(tuples))
+	}
+	if tuples[0].GetRelation() != "member" {
+		t.Fatalf("membership should be written first, got %s", tuples[0].GetRelation())
+	}
 }

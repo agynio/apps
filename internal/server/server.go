@@ -25,6 +25,14 @@ import (
 
 const (
 	identityMetadata = "x-identity-id"
+
+	// membershipRelation is written for every installation. It is the same
+	// relation a user's membership writes, so an installed app satisfies
+	// everything computed from `member` — including can_initiate on an
+	// `internal` agent, which resolves through `member from internal_access`
+	// and is reachable no other way. Nothing is written to the Organizations
+	// service's memberships table: that models people joining organizations.
+	membershipRelation = "member"
 )
 
 var permissionToRelation = map[string]string{
@@ -845,21 +853,39 @@ func (s *Server) orgRelationAllowed(ctx context.Context, identityID uuid.UUID, o
 	return resp.GetAllowed(), nil
 }
 
-func (s *Server) writeInstallationTuples(ctx context.Context, app store.App, organizationID uuid.UUID) error {
-	if len(app.Permissions) == 0 {
-		return nil
-	}
-	tuples := make([]*authorizationv1.TupleKey, 0, len(app.Permissions))
+// installationTuples is everything an installation grants in the organization:
+// membership, plus one relation per permission the app declared.
+//
+// An unknown permission is reported rather than handled, so the caller decides
+// whether it is fatal (install) or logged (cleanup).
+func installationTuples(app store.App, organizationID uuid.UUID) (tuples []*authorizationv1.TupleKey, unknownPermission string) {
+	user := fmt.Sprintf("identity:%s", app.IdentityID.String())
+	object := fmt.Sprintf("organization:%s", organizationID.String())
+
+	tuples = make([]*authorizationv1.TupleKey, 0, len(app.Permissions)+1)
+	tuples = append(tuples, &authorizationv1.TupleKey{
+		User:     user,
+		Relation: membershipRelation,
+		Object:   object,
+	})
 	for _, permission := range app.Permissions {
 		relation, ok := permissionToRelation[permission]
 		if !ok {
-			return status.Errorf(codes.Internal, "unknown permission %q", permission)
+			return tuples, permission
 		}
 		tuples = append(tuples, &authorizationv1.TupleKey{
-			User:     fmt.Sprintf("identity:%s", app.IdentityID.String()),
+			User:     user,
 			Relation: relation,
-			Object:   fmt.Sprintf("organization:%s", organizationID.String()),
+			Object:   object,
 		})
+	}
+	return tuples, ""
+}
+
+func (s *Server) writeInstallationTuples(ctx context.Context, app store.App, organizationID uuid.UUID) error {
+	tuples, unknown := installationTuples(app, organizationID)
+	if unknown != "" {
+		return status.Errorf(codes.Internal, "unknown permission %q", unknown)
 	}
 	if _, err := s.authorizationClient.Write(ctx, &authorizationv1.WriteRequest{Writes: tuples}); err != nil {
 		return status.Errorf(codes.Internal, "authorization write: %v", err)
@@ -868,24 +894,11 @@ func (s *Server) writeInstallationTuples(ctx context.Context, app store.App, org
 }
 
 func (s *Server) deleteInstallationTuples(ctx context.Context, app store.App, organizationID uuid.UUID) {
-	if len(app.Permissions) == 0 {
-		return
-	}
-	tuples := make([]*authorizationv1.TupleKey, 0, len(app.Permissions))
-	for _, permission := range app.Permissions {
-		relation, ok := permissionToRelation[permission]
-		if !ok {
-			log.Printf("ERROR: unknown permission %q for installation cleanup", permission)
-			continue
-		}
-		tuples = append(tuples, &authorizationv1.TupleKey{
-			User:     fmt.Sprintf("identity:%s", app.IdentityID.String()),
-			Relation: relation,
-			Object:   fmt.Sprintf("organization:%s", organizationID.String()),
-		})
-	}
-	if len(tuples) == 0 {
-		return
+	// An unknown permission still leaves membership, and the relations resolved
+	// before it, to clean up — so cleanup proceeds with what it has.
+	tuples, unknown := installationTuples(app, organizationID)
+	if unknown != "" {
+		log.Printf("ERROR: unknown permission %q for installation cleanup", unknown)
 	}
 	if _, err := s.authorizationClient.Write(ctx, &authorizationv1.WriteRequest{Deletes: tuples}); err != nil {
 		log.Printf("WARN: best-effort cleanup of installation tuples for org %s failed: %v", organizationID, err)
