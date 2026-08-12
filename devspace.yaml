@@ -1,7 +1,7 @@
 version: v2beta1
 
 vars:
-  APPS_NAMESPACE: platform
+  APPS_NAMESPACE: agyn-platform
 
 functions:
   patch_deployment: |-
