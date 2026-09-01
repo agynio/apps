@@ -301,6 +301,10 @@ type fakeIdentityClient struct {
 	registerRequests []*identityv1.RegisterIdentityRequest
 }
 
+func (f *fakeIdentityClient) DeleteOrganizationResources(context.Context, *identityv1.DeleteOrganizationResourcesRequest, ...grpc.CallOption) (*identityv1.DeleteOrganizationResourcesResponse, error) {
+	return &identityv1.DeleteOrganizationResourcesResponse{}, nil
+}
+
 func (f *fakeIdentityClient) RegisterIdentity(ctx context.Context, req *identityv1.RegisterIdentityRequest, _ ...grpc.CallOption) (*identityv1.RegisterIdentityResponse, error) {
 	f.registerRequests = append(f.registerRequests, req)
 	if f.registerFn != nil {
@@ -2890,5 +2894,108 @@ func TestInstallWritesNothingWhenEverythingExists(t *testing.T) {
 	}
 	if len(authorizationClient.writeRequests) != 0 {
 		t.Fatalf("expected no write, got %d", len(authorizationClient.writeRequests))
+	}
+}
+
+func TestDeleteOrganizationResourcesUninstallsAndDeletesPublishedApps(t *testing.T) {
+	organizationID := uuid.New()
+	otherOrganizationID := uuid.New()
+	publishedAppID, foreignAppID := uuid.New(), uuid.New()
+	inboundInstallID, outboundInstallID := uuid.New(), uuid.New()
+
+	apps := map[uuid.UUID]storepkg.App{
+		publishedAppID: {Meta: storepkg.EntityMeta{ID: publishedAppID}, OrganizationID: organizationID, IdentityID: uuid.New()},
+		foreignAppID:   {Meta: storepkg.EntityMeta{ID: foreignAppID}, OrganizationID: otherOrganizationID, IdentityID: uuid.New()},
+	}
+	installations := map[uuid.UUID]storepkg.Installation{
+		// A foreign app installed into the organization being torn down.
+		inboundInstallID: {Meta: storepkg.EntityMeta{ID: inboundInstallID}, AppID: foreignAppID, OrganizationID: organizationID},
+		// This organization's published app, installed somewhere else.
+		outboundInstallID: {Meta: storepkg.EntityMeta{ID: outboundInstallID}, AppID: publishedAppID, OrganizationID: otherOrganizationID},
+	}
+
+	var deletedApps []uuid.UUID
+	store := &fakeStore{
+		getFn: func(_ context.Context, id uuid.UUID) (storepkg.App, error) { return apps[id], nil },
+		listFn: func(_ context.Context, _ int, _ string, filter storepkg.ListAppsFilter) ([]storepkg.App, string, error) {
+			result := []storepkg.App{}
+			for _, app := range apps {
+				if filter.OrganizationID != nil && app.OrganizationID == *filter.OrganizationID {
+					result = append(result, app)
+				}
+			}
+			return result, "", nil
+		},
+		listInstallationsFn: func(_ context.Context, _ int, _ string, filter storepkg.ListInstallationsFilter) ([]storepkg.Installation, string, error) {
+			result := []storepkg.Installation{}
+			for _, installation := range installations {
+				switch {
+				case filter.OrganizationID != nil && installation.OrganizationID == *filter.OrganizationID:
+					result = append(result, installation)
+				case filter.AppID != nil && installation.AppID == *filter.AppID:
+					result = append(result, installation)
+				}
+			}
+			return result, "", nil
+		},
+		deleteInstallationFn: func(_ context.Context, id uuid.UUID) error {
+			delete(installations, id)
+			return nil
+		},
+		deleteFn: func(_ context.Context, id uuid.UUID) error {
+			deletedApps = append(deletedApps, id)
+			delete(apps, id)
+			return nil
+		},
+	}
+
+	srv := New(store, &fakeIdentityClient{}, &fakeAuthorizationClient{}, &fakeZitiManagementClient{})
+	// Internal RPC: no identity in the context, and none required.
+	_, err := srv.DeleteOrganizationResources(context.Background(), &appsv1.DeleteOrganizationResourcesRequest{
+		OrganizationId: organizationID.String(),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Both installations are gone: the inbound one because it was into this
+	// organization, the outbound one because deleting the publisher ends the
+	// commitment publishing made.
+	if len(installations) != 0 {
+		t.Fatalf("expected every installation removed, got %v", installations)
+	}
+	// Only the published app is deleted; the foreign app itself survives.
+	if len(deletedApps) != 1 || deletedApps[0] != publishedAppID {
+		t.Fatalf("expected only the published app deleted, got %v", deletedApps)
+	}
+}
+
+func TestDeleteOrganizationResourcesIsIdempotent(t *testing.T) {
+	store := &fakeStore{
+		listFn: func(context.Context, int, string, storepkg.ListAppsFilter) ([]storepkg.App, string, error) {
+			return nil, "", nil
+		},
+		listInstallationsFn: func(context.Context, int, string, storepkg.ListInstallationsFilter) ([]storepkg.Installation, string, error) {
+			return nil, "", nil
+		},
+	}
+	srv := New(store, &fakeIdentityClient{}, &fakeAuthorizationClient{}, &fakeZitiManagementClient{})
+
+	// The cascade retries a step it is unsure finished, so an organization with
+	// nothing left has to succeed rather than fail.
+	if _, err := srv.DeleteOrganizationResources(context.Background(), &appsv1.DeleteOrganizationResourcesRequest{
+		OrganizationId: uuid.New().String(),
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestDeleteOrganizationResourcesRejectsInvalidOrganizationID(t *testing.T) {
+	srv := New(&fakeStore{}, &fakeIdentityClient{}, &fakeAuthorizationClient{}, &fakeZitiManagementClient{})
+	_, err := srv.DeleteOrganizationResources(context.Background(), &appsv1.DeleteOrganizationResourcesRequest{
+		OrganizationId: "not-a-uuid",
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument, got %v", err)
 	}
 }
